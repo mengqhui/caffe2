@@ -166,6 +166,11 @@ OpSchema& OpSchema::EnforceOneToOneInplace() {
   return EnforceInplace([](int in, int out) { return in == out; });
 }
 
+OpSchema& OpSchema::Private() {
+  private_ = true;
+  return *this;
+}
+
 OpSchema& OpSchema::TensorInferenceFunction(
     TensorInferenceFunctionType function) {
   tensor_inference_function_ = function;
@@ -205,6 +210,17 @@ OpSchema& OpSchema::ScalarType(::caffe2::TensorProto_DataType dt) {
        out[0].set_data_type(dt);
        return out;
      });
+}
+
+OpSchema& OpSchema::CostInferenceFunction(CostInferenceFunctionType function) {
+  cost_inference_function_ = function;
+  return *this;
+}
+
+OpSchema& OpSchema::DeviceInferenceFunction(
+    DeviceInferenceFunctionType function) {
+  device_inference_function_ = function;
+  return *this;
 }
 
 OpSchema& OpSchema::SetDoc(const string& doc) {

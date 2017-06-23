@@ -31,10 +31,10 @@ bool NormalizeGradientOp<T, Context>::RunOnDevice() {
 
   auto square = inputMat.square();
   auto norm = square.colwise().sum().sqrt();
-
   gradInMat = gradOutMat.rowwise() * norm.inverse() -
       ((inputMat.rowwise() / norm.pow(3)).rowwise() *
        (gradOutMat * inputMat).colwise().sum());
+
   return true;
 }
 
@@ -51,10 +51,11 @@ class GetNormalizeGradient final : public GradientMakerBase {
   using GradientMakerBase::GradientMakerBase;
   vector<OperatorDef> GetGradientDefs() override {
     CAFFE_ENFORCE_EQ(def_.input_size(), 1);
-    return SingleGradientDef("NormalizeGradient",
-                             "",
-                             vector<string>{I(0), GO(0)},
-                             vector<string>{GI(0)});
+    return SingleGradientDef(
+        "NormalizeGradient",
+        "",
+        vector<string>{I(0), GO(0)},
+        vector<string>{GI(0)});
   }
 };
 REGISTER_GRADIENT(Normalize, GetNormalizeGradient);

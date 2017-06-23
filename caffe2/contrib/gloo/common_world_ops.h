@@ -1,12 +1,14 @@
 #pragma once
 
+#include "caffe2/contrib/gloo/common.h"
+#include "caffe2/contrib/gloo/store_handler.h"
 #include "caffe2/core/operator.h"
 #include "caffe2/distributed/store_handler.h"
 
-#include "gloo/rendezvous/context.h"
-#include "gloo/rendezvous/prefix_store.h"
+#include <gloo/common/error.h>
+#include <gloo/rendezvous/context.h>
+#include <gloo/rendezvous/prefix_store.h>
 
-#include "store_handler.h"
 
 namespace caffe2 {
 namespace gloo {
@@ -19,11 +21,18 @@ class CreateCommonWorld final : public Operator<Context> {
   CreateCommonWorld(const OperatorDef& operator_def, Workspace* ws)
       : Operator<Context>(operator_def, ws),
         size_(OperatorBase::template GetSingleArgument<int>("size", 0)),
-        rank_(OperatorBase::template GetSingleArgument<int>("rank", 0)) {
+        rank_(OperatorBase::template GetSingleArgument<int>("rank", 0)),
+        sync_(OperatorBase::template GetSingleArgument<bool>("sync", false)),
+        ws_(ws) {
     CAFFE_ENFORCE(def().has_name(), "CreateCommonWorld operator requires name");
     CAFFE_ENFORCE(rank_ >= 0 && rank_ < size_);
     name_ = def().name();
     device_ = createDevice();
+    status_blob_ =
+        OperatorBase::GetSingleArgument<std::string>("status_blob", "");
+    if (status_blob_ != "") {
+      ws_->CreateBlob(status_blob_);
+    }
   }
 
   virtual ~CreateCommonWorld() {}
@@ -35,31 +44,55 @@ class CreateCommonWorld final : public Operator<Context> {
     StoreHandlerWrapper wrapper(*handler);
     ::gloo::rendezvous::PrefixStore store(name_, wrapper);
 
-    // Create context and connect everyone to everyone
-    auto context = std::make_shared<::gloo::rendezvous::Context>(rank_, size_);
-    context->connectFullMesh(store, device_);
+    try {
+      // Create context and connect everyone to everyone
+      auto context =
+          std::make_shared<::gloo::rendezvous::Context>(rank_, size_);
+      context->connectFullMesh(store, device_);
 
-    // Switch pairs to synchronous mode
-    for (int i = 0; i < context->size; i++) {
-      auto& pair = context->getPair(i);
-      if (pair) {
-        pair->setSync(true, false);
+      // Switch pairs to synchronous mode if configured to do so
+      if (sync_) {
+        for (int i = 0; i < context->size; i++) {
+          auto& pair = context->getPair(i);
+          if (pair) {
+            pair->setSync(true, false);
+          }
+        }
       }
-    }
 
-    *OperatorBase::Output<std::shared_ptr<::gloo::Context>>(COMM) =
-        std::move(context);
+      *OperatorBase::Output<std::shared_ptr<::gloo::Context>>(COMM) =
+          std::move(context);
+    } catch (::gloo::IoException& ioe) {
+      LOG(ERROR) << "Caught gloo IO exception: " << ioe.what();
+      return handleException(ioe);
+    } catch (::caffe2::StoreHandlerTimeoutException& te) {
+      LOG(ERROR) << "Caught store handler timeout exception: " << te.what();
+      return handleException(te);
+    }
     return true;
   }
 
  private:
+  bool handleException(std::exception& ex) {
+    if (status_blob_ != "") {
+      signalFailure(ws_->GetBlob(status_blob_), ex);
+      return false;
+    } else {
+      throw ex;
+    }
+  }
+
   std::shared_ptr<::gloo::transport::Device> createDevice();
 
   const int size_;
   const int rank_;
+  const bool sync_;
 
   std::string name_;
   std::shared_ptr<::gloo::transport::Device> device_;
+
+  Workspace* ws_;
+  std::string status_blob_;
 
   INPUT_TAGS(STORE_HANDLER);
   OUTPUT_TAGS(COMM);

@@ -4,8 +4,7 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 from caffe2.python import recurrent, workspace
-from caffe2.python.cnn import CNNModelHelper
-from caffe2.python.model_helper import ModelHelperBase
+from caffe2.python.model_helper import ModelHelper
 from hypothesis import given
 import caffe2.python.hypothesis_test_util as hu
 import hypothesis.strategies as st
@@ -13,17 +12,16 @@ import numpy as np
 
 
 class RecurrentNetworkTest(hu.HypothesisTestCase):
-
     @given(T=st.integers(1, 4),
            n=st.integers(1, 5),
            d=st.integers(1, 5))
     def test_sum_mul(self, T, n, d):
-        model = ModelHelperBase(name='external')
+        model = ModelHelper(name='external')
 
         input_blob, initial_input_blob = model.net.AddExternalInputs(
             'input', 'initial_input')
 
-        step = ModelHelperBase(name='step', param_model=model)
+        step = ModelHelper(name='step', param_model=model)
         input_t, output_t_prev = step.net.AddExternalInput(
             'input_t', 'output_t_prev')
         output_t_internal = step.net.Sum([input_t, output_t_prev])
@@ -37,12 +35,12 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
            n=st.integers(1, 5),
            d=st.integers(1, 5))
     def test_mul(self, T, n, d):
-        model = ModelHelperBase(name='external')
+        model = ModelHelper(name='external')
 
         input_blob, initial_input_blob = model.net.AddExternalInputs(
             'input', 'initial_input')
 
-        step = ModelHelperBase(name='step', param_model=model)
+        step = ModelHelper(name='step', param_model=model)
         input_t, output_t_prev = step.net.AddExternalInput(
             'input_t', 'output_t_prev')
         output_t = step.net.Mul([input_t, output_t_prev])
@@ -56,7 +54,7 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
 
         input = np.random.randn(T, n, d).astype(np.float32)
         initial_input = np.random.randn(1, n, d).astype(np.float32)
-
+        print(locals())
         recurrent.recurrent_net(
             net=model.net,
             cell_net=step.net,
@@ -206,7 +204,7 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
         the current one - input_state_t. We specify that using `link_window`
         argument of RecurrentNetwork. We need that many elements to
         compute a single convolution step. Also, note that `link_window`
-        specifies how many element to link starting at
+        specifies how many elements to link starting at
         `timestep` + `link_offset` position.
 
         2. First few steps might require additional zero padding from the left,
@@ -221,7 +219,7 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
         if we apply convolution over all elements simultaneously,
         since the whole input_state sequence was generated at the end.
     '''
-        model = CNNModelHelper(name='model')
+        model = ModelHelper(name='model')
         fake_inputs = model.param_init_net.UniformFill(
             [],
             'fake_inputs',
@@ -241,7 +239,7 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
             value=0.0,
             shape=[1, batch_size, state_size],
         )
-        step_model = CNNModelHelper(name='step_model', param_model=model)
+        step_model = ModelHelper(name='step_model', param_model=model)
         (
             fake_input_t,
             timestep,
@@ -288,19 +286,19 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
         input_state_all, output_state_all, _ = model.net.RecurrentNetwork(
             all_inputs,
             all_outputs + ['step_workspaces'],
-            param=map(all_inputs.index, step_model.params),
+            param=[all_inputs.index(p) for p in step_model.params],
             alias_src=recurrent_states,
             alias_dst=all_outputs,
             alias_offset=[conv_window - 1, 1],
             recurrent_states=recurrent_states,
-            initial_recurrent_state_ids=map(
-                all_inputs.index,
-                initial_recurrent_states,
-            ),
-            link_internal=map(
-                str,
-                [input_state_t_prev, input_state_t, output_state_t],
-            ),
+            initial_recurrent_state_ids=[
+                all_inputs.index(s) for s in initial_recurrent_states
+            ],
+            link_internal=[
+                str(input_state_t_prev),
+                str(input_state_t),
+                str(output_state_t),
+            ],
             link_external=['input_state', 'input_state', 'output_state'],
             link_offset=[0, conv_window - 1, 1],
             link_window=[conv_window, 1, 1],

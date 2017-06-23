@@ -8,6 +8,7 @@ import numpy as np
 
 import unittest
 import pickle
+import random
 
 
 class TestDB(unittest.TestCase):
@@ -90,7 +91,7 @@ class TestDB(unittest.TestCase):
             ('field2', a)
         )
         self.assertEquals(s['field2:lengths'], a.lengths)
-        self.assertEquals(s['field2:items'], a.items)
+        self.assertEquals(s['field2:values'], a.items)
         with self.assertRaises(KeyError):
             s['fields2:items:non_existent']
         with self.assertRaises(KeyError):
@@ -105,8 +106,8 @@ class TestDB(unittest.TestCase):
             ('field1', schema.Scalar(dtype=np.int32)),
             ('field2', a)
         )
-        self.assertEquals(s['field2:keys'], a.keys)
-        self.assertEquals(s['field2:values'], a.values)
+        self.assertEquals(s['field2:values:keys'], a.keys)
+        self.assertEquals(s['field2:values:values'], a.values)
         with self.assertRaises(KeyError):
             s['fields2:keys:non_existent']
 
@@ -154,6 +155,11 @@ class TestDB(unittest.TestCase):
             schema.Struct(
                 ('a', schema.Scalar()),
                 ('a', schema.Scalar()))
+
+    def testAssignToField(self):
+        with self.assertRaises(TypeError):
+            s = schema.Struct(('a', schema.Scalar()))
+            s.a = schema.Scalar()
 
     def testPreservesEmptyFields(self):
         s = schema.Struct(
@@ -288,3 +294,20 @@ class TestDB(unittest.TestCase):
         self.assertFalse('x' in st)
         self.assertFalse('b:c:x' in st)
         self.assertFalse('b:c:d:x' in st)
+
+    def testFromColumnList(self):
+        st = schema.Struct(
+            ('a', schema.Scalar()),
+            ('b', schema.List(schema.Scalar())),
+            ('c', schema.Map(schema.Scalar(), schema.Scalar()))
+        )
+        columns = st.field_names()
+        # test that recovery works for arbitrary order
+        for _ in range(10):
+            some_blobs = [core.BlobReference('blob:' + x) for x in columns]
+            rec = schema.from_column_list(columns, col_blobs=some_blobs)
+            self.assertTrue(rec.has_blobs())
+            self.assertEqual(sorted(st.field_names()), sorted(rec.field_names()))
+            self.assertEqual([str(blob) for blob in rec.field_blobs()],
+                             [str('blob:' + name) for name in rec.field_names()])
+            random.shuffle(columns)

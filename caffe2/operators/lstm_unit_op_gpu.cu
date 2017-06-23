@@ -13,11 +13,6 @@ __device__ Dtype cuda_sigmoid(const Dtype x) {
   return Dtype(1) / (Dtype(1) + exp(-x));
 }
 
-template <typename Dtype>
-__device__ Dtype cuda_tanh(const Dtype x) {
-  return Dtype(2) * cuda_sigmoid(Dtype(2) * x) - Dtype(1);
-}
-
 template <typename T>
 __global__ void LSTMUnitKernel(
     const int nthreads,
@@ -27,6 +22,7 @@ __global__ void LSTMUnitKernel(
     const T* C_prev,
     const T* X,
     const int32_t* seqLengths,
+    bool drop_states,
     T* C,
     T* H,
     const T forget_bias) {
@@ -35,18 +31,18 @@ __global__ void LSTMUnitKernel(
     const int d = index % dim;
     const bool valid = t < seqLengths[n];
     if (!valid) {
-      H[index] = H_prev[index];
-      C[index] = C_prev[index];
+      H[index] = H_prev[index] * !drop_states;
+      C[index] = C_prev[index] * !drop_states;
     } else {
       const T* X_offset = X + 4 * dim * n;
       const T i = cuda_sigmoid(X_offset[d]);
       const T f = cuda_sigmoid(X_offset[1 * dim + d] + forget_bias);
       const T o = cuda_sigmoid(X_offset[2 * dim + d]);
-      const T g = cuda_tanh(X_offset[3 * dim + d]);
+      const T g = tanh(X_offset[3 * dim + d]);
       const T c_prev = C_prev[index];
       const T c = f * c_prev + i * g;
       C[index] = c;
-      const T tanh_c = cuda_tanh(c);
+      const T tanh_c = tanh(c);
       H[index] = o * tanh_c;
     }
   }
@@ -64,6 +60,7 @@ __global__ void LSTMUnitGradientKernel(
     const int32_t* seqLengths,
     const T* C_diff,
     const T* H_diff,
+    bool drop_states,
     T* H_prev_diff,
     T* C_prev_diff,
     T* X_diff,
@@ -81,8 +78,8 @@ __global__ void LSTMUnitGradientKernel(
     T* o_diff = X_diff_offset + 2 * dim + d;
     T* g_diff = X_diff_offset + 3 * dim + d;
     if (!valid) {
-      *c_prev_diff = C_diff[index];
-      *h_prev_diff = H_diff[index];
+      *h_prev_diff = H_diff[index] * !drop_states;
+      *c_prev_diff = C_diff[index] * !drop_states;
       *i_diff = 0;
       *f_diff = 0;
       *o_diff = 0;
@@ -91,10 +88,10 @@ __global__ void LSTMUnitGradientKernel(
       const T i = cuda_sigmoid(X_offset[d]);
       const T f = cuda_sigmoid(X_offset[1 * dim + d] + forget_bias);
       const T o = cuda_sigmoid(X_offset[2 * dim + d]);
-      const T g = cuda_tanh(X_offset[3 * dim + d]);
+      const T g = tanh(X_offset[3 * dim + d]);
       const T c_prev = C_prev[index];
       const T c = C[index];
-      const T tanh_c = cuda_tanh(c);
+      const T tanh_c = tanh(c);
       const T c_term_diff =
           C_diff[index] + H_diff[index] * o * (1 - tanh_c * tanh_c);
       *c_prev_diff = c_term_diff * f;
@@ -116,6 +113,7 @@ void LSTMUnit<float, CUDAContext>(
     const float* C_prev,
     const float* X,
     const int32_t* seqLengths,
+    bool drop_states,
     float* C,
     float* H,
     const float forget_bias,
@@ -125,7 +123,17 @@ void LSTMUnit<float, CUDAContext>(
       CAFFE_CUDA_NUM_THREADS,
       0,
       context->cuda_stream()>>>(
-      N * D, D, t, H_prev, C_prev, X, seqLengths, C, H, forget_bias);
+      N * D,
+      D,
+      t,
+      H_prev,
+      C_prev,
+      X,
+      seqLengths,
+      drop_states,
+      C,
+      H,
+      forget_bias);
 }
 
 template <>
@@ -140,6 +148,7 @@ void LSTMUnitGradient<float, CUDAContext>(
     const float* H,
     const float* C_diff,
     const float* H_diff,
+    bool drop_states,
     float* H_prev_diff,
     float* C_prev_diff,
     float* X_diff,
@@ -160,6 +169,7 @@ void LSTMUnitGradient<float, CUDAContext>(
       seqLengths,
       C_diff,
       H_diff,
+      drop_states,
       H_prev_diff,
       C_prev_diff,
       X_diff,

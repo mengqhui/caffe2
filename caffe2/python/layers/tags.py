@@ -29,8 +29,13 @@ class TagContext(object):
 class Tags(object):
     # TODO(amalevich): Tags might need to live in their own contexts, add this
     # split later
-    TRAIN_ONLY = 'train_only'
+    EXCLUDE_FROM_TRAIN = 'exclude_from_train'
+    EXCLUDE_FROM_EVAL = 'exclude_from_eval'
+    EXCLUDE_FROM_PREDICTION = 'exclude_from_prediction'
+    EXCLUDE_FROM_ACCUMULATE_PRED = 'exclude_from_accumulate_pred'
     PREPROCESSING = 'preprocessing'
+    HANDLE_AS_SPARSE_LAYER = 'handle_as_sparse_layer'
+    GRADIENT_FROM_PS = 'gradient_from_ps'
 
     # In certain cases we want to have different schema for training and
     # prediction, as an example in prediction we might need to have only
@@ -50,3 +55,11 @@ class Tags(object):
 
     def __exit__(self, type, value, traceback):
         TagContext.current().remove_tags(self.tags)
+
+
+Tags.TRAIN_ONLY = [Tags.EXCLUDE_FROM_PREDICTION, Tags.EXCLUDE_FROM_EVAL,
+                   Tags.EXCLUDE_FROM_ACCUMULATE_PRED]
+Tags.EVAL_ONLY = [Tags.EXCLUDE_FROM_PREDICTION, Tags.EXCLUDE_FROM_TRAIN,
+                  Tags.EXCLUDE_FROM_ACCUMULATE_PRED]
+Tags.PREDICTION_ONLY = [Tags.EXCLUDE_FROM_TRAIN, Tags.EXCLUDE_FROM_EVAL,
+                        Tags.EXCLUDE_FROM_ACCUMULATE_PRED]

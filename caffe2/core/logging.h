@@ -41,6 +41,16 @@ constexpr bool IsUsingGoogleLogging() {
 #endif
 }
 
+/**
+ * A utility to allow one to show log info to stderr after the program starts.
+ *
+ * This is similar to calling GLOG's --logtostderr, or setting caffe2_log_level
+ * to smaller than INFO. You are recommended to only use this in a few sparse
+ * cases, such as when you want to write a tutorial or something. Normally, use
+ * the commandline flags to set the log level.
+ */
+void ShowLogInfoToStderr();
+
 inline void MakeStringInternal(std::stringstream& ss) {}
 
 template <typename T>
@@ -242,6 +252,20 @@ BINARY_COMP_HELPER(LessEquals, <=)
           r.get_message_and_free(::caffe2::MakeString(__VA_ARGS__))); \
     }                                                                 \
   } while (false)
+
+#define CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(condition, expr, ...)                 \
+  do {                                                                \
+    using namespace ::caffe2::enforce_detail;                         \
+    const EnforceFailMessage& r = (condition);                        \
+    if (r.bad()) {                                                    \
+      throw ::caffe2::EnforceNotMet(                                  \
+          __FILE__,                                                   \
+          __LINE__,                                                   \
+          expr,                                                       \
+          r.get_message_and_free(::caffe2::MakeString(__VA_ARGS__)),  \
+          this);                                                      \
+    }                                                                 \
+  } while (false)
 }
 
 #define CAFFE_ENFORCE_THAT(condition, ...) \
@@ -259,7 +283,18 @@ BINARY_COMP_HELPER(LessEquals, <=)
   CAFFE_ENFORCE_THAT_IMPL(GreaterEquals((x), (y)), #x " >= " #y, __VA_ARGS__)
 #define CAFFE_ENFORCE_GT(x, y, ...) \
   CAFFE_ENFORCE_THAT_IMPL(Greater((x), (y)), #x " > " #y, __VA_ARGS__)
-
+#define CAFFE_ENFORCE_EQ_WITH_CALLER(x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(Equals((x), (y)), #x " == " #y, __VA_ARGS__)
+#define CAFFE_ENFORCE_NE_WITH_CALLER(x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(NotEquals((x), (y)), #x " != " #y, __VA_ARGS__)
+#define CAFFE_ENFORCE_LE_WITH_CALLER(x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(LessEquals((x), (y)), #x " <= " #y, __VA_ARGS__)
+#define CAFFE_ENFORCE_LT_WITH_CALLER(x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(Less((x), (y)), #x " < " #y, __VA_ARGS__)
+#define CAFFE_ENFORCE_GE_WITH_CALLER(x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(GreaterEquals((x), (y)), #x " >= " #y, __VA_ARGS__)
+#define CAFFE_ENFORCE_GT_WITH_CALLER(x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(Greater((x), (y)), #x " > " #y, __VA_ARGS__)
 } // namespace caffe2
 
 #endif // CAFFE2_CORE_LOGGING_H_

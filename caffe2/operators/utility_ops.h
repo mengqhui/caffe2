@@ -149,7 +149,7 @@ class AliasOp final : public Operator<Context> {
 
   bool RunOnDevice() override {
     auto& input = Input(0);
-    DCHECK_GT(input.size(), 0);
+    CAFFE_ENFORCE_GE(input.size(), 0, "Tensor is not initialized");
     Output(0)->ResizeLike(input);
     Output(0)->ShareData(input);
     return true;
@@ -473,6 +473,10 @@ class ScatterWeightedSumOp : public Operator<Context> {
     }
     return true;
   }
+  Tensor<CPUContext> x_data_host_;
+  Tensor<CPUContext> weights_host_;
+  Tensor<Context> x_data_device_;
+  Tensor<Context> weights_device_;
 };
 
 
@@ -1024,6 +1028,28 @@ class ShapeOp : public Operator<Context> {
   }
 };
 
+// Return the size of a tensor
+template <class Context>
+class SizeOp : public Operator<Context> {
+ public:
+  USE_OPERATOR_CONTEXT_FUNCTIONS;
+  USE_SIMPLE_CTOR_DTOR(SizeOp);
+
+  bool RunOnDevice() override {
+    auto& input = Input(0);
+    auto* output = Output(0);
+
+    output->Resize(vector<TIndex>());
+    auto* output_data = output->template mutable_data<int64_t>();
+
+    auto size = input.size();
+    math::Set<int64_t, Context>(
+        1, static_cast<int64_t>(size), output_data, &context_);
+
+    return true;
+  }
+};
+
 // returns a shape to be passed to Reshape
 template <class Context>
 class LengthsToShapeOp : public Operator<Context> {
@@ -1190,7 +1216,10 @@ class GatherOp : public Operator<Context> {
       auto idx = idxs[i];
       CAFFE_ENFORCE(
           0 <= idx && idx < data.dim(0),
-          "INDICES element is out of DATA bounds");
+          "INDICES element is out of DATA bounds, id=",
+          idx,
+          " data_dim=",
+          data.dim(0));
       auto src = src_base + idx * block_bytesize;
       context_.template CopyItems<Context, Context>(
           data.meta(), block_size, src, out + block_bytesize * i);
@@ -1378,47 +1407,12 @@ class UniqueOp : public Operator<Context> {
 
  private:
   vector<int> order_;
+  Tensor<Context> thrust_unique_buffer_;
+  Tensor<Context> cuda_order_buffer_;
+  Tensor<Context> second_order_buffer_;
 
   template <typename T>
-  void DoRun() {
-    auto& inputTensor = Input(0);
-    // use dim32 to enforce that it's fine to have remapping of type int
-    int N = inputTensor.dim32(0);
-    CAFFE_ENFORCE_EQ(inputTensor.ndim(), 1, "Input should be a vector");
-    auto* uniqueTensor = Output(UNIQUE);
-
-    int* remapping = nullptr;
-    if (REMAPPING < OutputSize()) {
-      auto* remappingTensor = Output(REMAPPING);
-      remappingTensor->ResizeLike(inputTensor);
-      remapping = remappingTensor->template mutable_data<int>();
-    }
-
-    const T* input = inputTensor.template data<T>();
-    // TODO(dzhulgakov): if perf becomes an issue consider doing hash table
-    // instead of sorting
-    order_.resize(N);
-    std::iota(order_.begin(), order_.end(), 0);
-    std::sort(order_.begin(), order_.end(), [input](const int x, const int y) {
-      return input[x] < input[y];
-    });
-    int K = N;
-    for (int i = 1; i < N; ++i) {
-      K -= input[order_[i]] == input[order_[i - 1]];
-    }
-    uniqueTensor->Resize(K);
-    T* unique = uniqueTensor->template mutable_data<T>();
-    K = 0;
-    T prev = -1;
-    for (int i = 0; i < N; ++i) {
-      if (i == 0 || prev != input[order_[i]]) {
-        prev = unique[K++] = input[order_[i]];
-      }
-      if (remapping) {
-        remapping[order_[i]] = K - 1;
-      }
-    }
-  }
+  void DoRun();
 
  public:
   OUTPUT_TAGS(UNIQUE, REMAPPING);

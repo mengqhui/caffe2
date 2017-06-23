@@ -1,15 +1,25 @@
 ## @package workspace
 # Module caffe2.python.workspace
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
 import contextlib
 from google.protobuf.message import Message
 from multiprocessing import Process
 import os
+try:
+    from past.builtins import basestring
+except ImportError:
+    print("You don't have the past package installed. ",
+          "This is necessary for python 2/3 compatibility. ",
+          "To do this, do 'pip install future'.")
+    import sys
+    sys.exit(1)
 import shutil
 import socket
 import tempfile
 import logging
-
-from six import string_types
 
 import numpy as np
 from caffe2.proto import caffe2_pb2
@@ -49,14 +59,6 @@ else:
     GetDefaultGPUID = lambda: 0 # noqa
     GetCuDNNVersion = lambda: 0 # noqa
     GetCudaPeerAccessPattern = lambda: np.array([]) # noqa
-
-
-# Python 2 and 3 compatibility: test if basestring exists
-try:
-    basestring  # NOQA
-except NameError:
-    # This is python3 so we define basestring.
-    basestring = str
 
 
 def _GetFreeFlaskPort():
@@ -113,7 +115,7 @@ def StringifyProto(obj):
   Raises:
     AttributeError: if the passed in object does not have the right attribute.
   """
-    if isinstance(obj, string_types):
+    if isinstance(obj, basestring):
         return obj
     else:
         if isinstance(obj, Message):
@@ -161,16 +163,17 @@ def RunNetOnce(net):
     return C.run_net_once(StringifyProto(net))
 
 
-def RunNet(name, num_iter=1):
+def RunNet(name, num_iter=1, allow_fail=False):
     """Runs a given net.
 
     Inputs:
       name: the name of the net, or a reference to the net.
       num_iter: number of iterations to run
+      allow_fail: if True, does not assert on net exec failure but returns False
     Returns:
       True or an exception.
     """
-    return C.run_net(StringifyNetName(name), num_iter)
+    return C.run_net(StringifyNetName(name), num_iter, allow_fail)
 
 
 def RunPlan(plan_or_step):
@@ -239,7 +242,7 @@ def FeedBlob(name, arr, device_option=None):
     """
     if type(arr) is caffe2_pb2.TensorProto:
         arr = utils.Caffe2TensorToNumpyArray(arr)
-    if type(arr) is np.ndarray and arr.dtype.kind == 'S':
+    if type(arr) is np.ndarray and arr.dtype.kind in 'SU':
         # Plain NumPy strings are weird, let's use objects instead
         arr = arr.astype(np.object)
 

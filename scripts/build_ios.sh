@@ -1,6 +1,6 @@
 #!/bin/bash
 ##############################################################################
-# Example command to build the android target.
+# Example command to build the iOS target.
 ##############################################################################
 # 
 # This script shows how one can build a Caffe2 binary for the iOS platform
@@ -9,27 +9,36 @@
 
 CAFFE2_ROOT="$( cd "$(dirname "$0")"/.. ; pwd -P)"
 echo "Caffe2 codebase root is: $CAFFE2_ROOT"
-# We are going to build the target into build_android.
+# We are going to build the target into build_ios.
 BUILD_ROOT=$CAFFE2_ROOT/build_ios
 mkdir -p $BUILD_ROOT
 echo "Build Caffe2 ios into: $BUILD_ROOT"
 
 # Build protobuf from third_party so we have a host protoc binary.
 echo "Building protoc"
-$CAFFE2_ROOT/scripts/build_host_protoc.sh || exit 1
+BITCODE_FLAGS="-DCMAKE_C_FLAGS=-fembed-bitcode -DCMAKE_CXX_FLAGS=-fembed-bitcode "
+$CAFFE2_ROOT/scripts/build_host_protoc.sh --other-flags $BITCODE_FLAGS || exit 1
 
-# Now, actually build the android target.
+# Now, actually build the iOS target.
 echo "Building caffe2"
 cd $BUILD_ROOT
+
+if [ -z ${IOS_PLATFORM+x} ]; then
+    # IOS_PLATFORM is not set, in which case we will default to OS, which
+    # builds iOS.
+    IOS_PLATFORM=OS
+fi
 
 cmake .. \
     -DCMAKE_TOOLCHAIN_FILE=$CAFFE2_ROOT/third_party/ios-cmake/toolchain/iOS.cmake\
     -DCMAKE_INSTALL_PREFIX=../install \
     -DCMAKE_BUILD_TYPE=Release \
-    -DIOS_PLATFORM=OS \
+    -DIOS_PLATFORM=${IOS_PLATFORM} \
     -DUSE_CUDA=OFF \
     -DBUILD_TEST=OFF \
     -DBUILD_BINARY=OFF \
+    -DCMAKE_C_FLAGS=-fembed-bitcode \
+    -DCMAKE_CXX_FLAGS=-fembed-bitcode \
     -DUSE_LMDB=OFF \
     -DUSE_LEVELDB=OFF \
     -DBUILD_PYTHON=OFF \
@@ -42,4 +51,4 @@ cmake .. \
     -DCMAKE_USE_PTHREADS_INIT=1 \
     $@ \
     || exit 1
-make
+cmake --build . -- "-j$(sysctl -n hw.ncpu)"

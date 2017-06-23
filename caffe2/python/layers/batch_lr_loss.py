@@ -30,7 +30,7 @@ class BatchLRLoss(ModelLayer):
             ),
             input_record
         )
-        self.tags.update({Tags.TRAIN_ONLY})
+        self.tags.update([Tags.EXCLUDE_FROM_PREDICTION])
 
         self.output_schema = schema.Scalar(
             np.float32,
@@ -62,7 +62,10 @@ class BatchLRLoss(ModelLayer):
                     weight_blob + '_float32',
                     to=core.DataType.FLOAT
                 )
-            weight_blob = net.StopGradient([weight_blob], [weight_blob])
+            weight_blob = net.StopGradient(
+                [weight_blob],
+                [net.NextScopedBlob('weight_stop_gradient')],
+            )
             xent = net.Mul(
                 [xent, weight_blob],
                 net.NextScopedBlob('weighted_cross_entropy'),

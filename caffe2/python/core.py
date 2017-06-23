@@ -5,13 +5,21 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from collections import namedtuple
-from collections import OrderedDict
+from collections import namedtuple, OrderedDict
+try:
+    from past.builtins import basestring
+except ImportError:
+    print("You don't have the past package installed. ",
+          "This is necessary for python 2/3 compatibility. ",
+          "To do this, do 'pip install future'.")
+    import sys
+    sys.exit(1)
 
 from caffe2.proto import caffe2_pb2
 from collections import defaultdict
 from caffe2.python import scope, utils, workspace
 import caffe2.python._import_c_extension as C
+import pickle
 import numpy as np
 import sys
 
@@ -40,13 +48,6 @@ def _InitDataType():
 
 _InitDataType()
 
-# Python 2 and 3 compatibility: test if basestring exists
-try:
-    basestring = basestring  # NOQA
-except NameError:
-    # This is python3 so we define basestring.
-    basestring = str
-
 
 def _GetRegisteredOperators():
     return set(workspace.RegisteredOperators())
@@ -72,26 +73,6 @@ def GetGlobalInitArgs():
     return _GLOBAL_INIT_ARGS[:]
 
 
-_WORKER_INIT_CALLS = []
-
-
-def worker_init_func(func):
-    """
-    By decorating a function with this, each call to the function will be
-    recorded at workflow time and replayed in each of the works at startup.
-    Used for example for registering caffe python operators.
-    """
-    def call(*args, **kwargs):
-        _WORKER_INIT_CALLS.append((func, args, kwargs))
-        return func(*args, **kwargs)
-
-    return call
-
-
-def GetWorkerInitCalls():
-    return _WORKER_INIT_CALLS[:]
-
-
 def IsOperator(op_type):
     return (op_type in _REGISTERED_OPERATORS)
 
@@ -107,6 +88,37 @@ def DeviceOption(device_type, cuda_gpu_id=0, random_seed=None):
     if random_seed is not None:
         option.random_seed = random_seed
     return option
+
+
+def InferBlobDevices(net):
+    '''
+    Compute mapping from parameters to devices by looking at the
+    device option of the op that creates the blob has
+    '''
+    mapping = {}
+    for op in net.Proto().op:
+        op_device = op.device_option
+        if op_device is None:
+            op_device = caffe2_pb2.DeviceOption(caffe2_pb2.CPU)
+        # TODO: T18892922, use device annotations
+        for b in op.output:
+            mapping[b] = op_device
+    return mapping
+
+
+def InferOpBlobDevices(op):
+    device_info = C.infer_op_input_output_device(op.SerializeToString())
+    input_info = []
+    output_info = []
+    for dev_str in device_info[0]:
+        device_option = caffe2_pb2.DeviceOption()
+        device_option.ParseFromString(dev_str)
+        input_info.append(device_option)
+    for dev_str in device_info[1]:
+        device_option = caffe2_pb2.DeviceOption()
+        device_option.ParseFromString(dev_str)
+        output_info.append(device_option)
+    return input_info, output_info
 
 
 GradientSlice = namedtuple('GradientSlice', ['indices', 'values'])
@@ -203,9 +215,21 @@ class BlobReference(object):
         return lambda *args, **kwargs: self._CreateAndAddToNet(
             op_type, *args, **kwargs)
 
+    def __dir__(self):
+        additional_methods = [
+            op
+            for op in _REGISTERED_OPERATORS
+            if '_ENGINE_' not in op or '_ENGINE_CUDNN' in op]
+        return sorted(set(
+            dir(type(self)) +
+            self.__dict__.keys() +
+            additional_methods))
+
 
 def ScopedName(name):
     """prefix the name with the current scope."""
+    if isinstance(name, bytes):
+        name = name.decode('ascii')
     return scope.CurrentNameScope() + name
 
 
@@ -300,13 +324,20 @@ def CreateOperator(
     return operator
 
 
-def _RegisterPythonImpl(f, grad_f=None, pass_workspace=False):
-    if isinstance(f, tuple):
-        f = f[0](*f[1], **f[2])
-    if isinstance(grad_f, tuple):
-        grad_f = grad_f[0](*grad_f[1], **grad_f[2])
+def _RegisterPythonImpl(
+    f, grad_f=None, python_func_type=None, pass_workspace=False
+):
+    if python_func_type:
+        func = python_func_type(f)
+        f = func.forward
+        grad_f = func.backward
+    else:
+        if isinstance(f, tuple):
+            f = f[0](*f[1], **f[2])
+        if isinstance(grad_f, tuple):
+            grad_f = grad_f[0](*grad_f[1], **grad_f[2])
 
-    token = C.register_python_op(f, pass_workspace)
+    token = C.register_python_op(f, pass_workspace, '')
     if grad_f:
         C.register_python_gradient_op(token, grad_f)
     return token
@@ -317,6 +348,7 @@ def CreatePythonOperator(
     outputs,
     grad_f=None,
     pass_workspace=False,
+    python_func_type=None,
     *args,
     **kwargs
 ):
@@ -329,7 +361,7 @@ def CreatePythonOperator(
     the workspace directly), use on your own risk.
     """
     kwargs["token"] = _RegisterPythonImpl(
-        f, grad_f, pass_workspace=pass_workspace
+        f, grad_f, python_func_type, pass_workspace=pass_workspace
     )
     return CreateOperator("Python", inputs, outputs, *args, **kwargs)
 
@@ -602,19 +634,33 @@ class IR(object):
         sum_op_input = []
         cnt = 0
 
+        assert len(generators) > 1
+
+        first_grad_op = True
         for generator in generators:
             grad_op, idx, g = generator
             assert(type(g) is not GradientSlice)
             if grad_op:
-                out, cnt = self._DisambiguateGradOpOutput(grad_op, idx, cnt)
+                if first_grad_op:
+                    first_grad_op = False
+                    out = grad_op.output[idx]
+                else:
+                    out, cnt = self._DisambiguateGradOpOutput(grad_op, idx, cnt)
                 sum_op_input.append(out)
             else:
                 self._CheckSumOpsConflict(out_base_name, g)
                 sum_op_input.append(str(g))
 
+        if out_base_name in sum_op_input:
+            # Sum inplace mode works only for the first input
+            # So we do a swap
+            idx = sum_op_input.index(out_base_name)
+            sum_op_input[0], sum_op_input[idx] = (
+                sum_op_input[idx], sum_op_input[0]
+            )
         sum_ops = [CreateOperator(
             "Sum",
-            map(BlobReference, sum_op_input),
+            [BlobReference(x) for x in sum_op_input],
             BlobReference(out_base_name))]
         return sum_ops, out_base_name
 
@@ -651,15 +697,16 @@ class IR(object):
         sum_ops = [
             CreateOperator(
                 "Concat",
-                map(BlobReference, indices_concat_input),
-                map(BlobReference,
-                    [indices_concat_output, indices_concat_split]),
+                [BlobReference(x) for x in indices_concat_input],
+                [BlobReference(x) for x in
+                    [indices_concat_output, indices_concat_split]],
                 axis=0
             ),
             CreateOperator(
                 "Concat",
-                map(BlobReference, values_concat_input),
-                map(BlobReference, [values_concat_output, values_concat_split]),
+                [BlobReference(x) for x in values_concat_input],
+                [BlobReference(x) for x in
+                    [values_concat_output, values_concat_split]],
                 axis=0
             ),
         ]
@@ -711,10 +758,6 @@ class IR(object):
                     all_device_options.append(g.grad_op_values.device_option)
                     all_gradient_names.append(g.gradient.values)
 
-        # Check if all grad names are the same.
-        if len(set(all_gradient_names)) > 1:
-            raise RuntimeError('Unexpected behavior: not all grad output '
-                               'names are the same.')
         # Check if all grad op device options are the same.
         if len(all_device_options) >= 2 and not all(
                 d == all_device_options[0] for d in all_device_options[1:]):
@@ -768,10 +811,22 @@ class IR(object):
             grad_map[input_name] = g
         return additional_sum_ops, grad_map
 
+    def _AppendAutoGradGenerator(self, y, grad, autograd_op):
+        # Gradient here is not sparse  as it was generated by
+        # a ConstantFill operator. Autogeneration for sparse gradients is
+        # not supported
+        generator = GradGenMeta(
+            autograd_op, 0 if autograd_op else None, str(grad))
+
+        self.gradient_generators[str(y)][self.frontier[str(y)]].append(
+            generator)
+
+
     def _GetInitGradients(self, ys):
         input_to_grad = {}
         gradient_ops = []
         for y, g in ys.items():
+            autograd_op = None
             if g is None:
                 autograd_op = CreateOperator(
                     "ConstantFill", [y], [str(y) + "_autogen_grad"],
@@ -783,6 +838,10 @@ class IR(object):
             input_to_grad[str(y)] = (
                 GradientSlice(str(g[0]), str(g[1]))
                 if isinstance(g, GradientSlice) else str(g))
+            # Autogenerated gradients are assumed to be provided for the last
+            # input version
+            if autograd_op is not None:
+                self._AppendAutoGradGenerator(y, g, autograd_op)
 
         return input_to_grad, gradient_ops
 
@@ -793,7 +852,9 @@ class IR(object):
         forward_op, in_versions, out_versions = self.ssa[forward_op_idx]
         g_output = list(
             input_to_grad.get(name, None) for name in forward_op.output)
-        if not all(g is None for g in g_output):
+
+        if not all(g is None for g in g_output) or (
+                forward_op.type == "ZeroGradient"):
             gradient_ops, g_input = GradientRegistry.GetGradientForOp(
                 forward_op, g_output)
             # Check if the gradient operators are legal, and update
@@ -809,7 +870,7 @@ class IR(object):
                 if grad is not None or \
                     name not in input_to_grad or \
                         name in list(forward_op.output):
-                        new_input_to_grad[name] = grad
+                    new_input_to_grad[name] = grad
 
         return new_input_to_grad, gradient_ops
 
@@ -833,6 +894,8 @@ class IR(object):
         # gradients.
         for y, _ in ys.items():
             self.gradient_frontier[y] = self.frontier[y]
+            self.input_usages[str(y)][self.frontier[str(y)]].append(
+                len(self.ssa))
 
         all_input_to_grad, all_gradient_ops = self._GetInitGradients(ys)
 
@@ -930,14 +993,15 @@ class GradientRegistry(object):
             gradient_ops, g_input = cls._GetGradientForOpCC(op, g_output)
         except Exception as e:
             # Not supported in C++; will try python registration next.
-
-            try:
+            if op.type in cls.gradient_registry_:
                 gradient_ops, g_input = cls.gradient_registry_[op.type](
-                    op, g_output)
-            except KeyError:
+                    op, g_output
+                )
+            else:
                 raise Exception(
-                    "No gradient registered for {}. ".format(op.type) +
-                    "Exception from creating the gradient op: {}.".format(e))
+                    "Exception when creating the gradient for [{}]: {}.".
+                    format(op.type, e)
+                )
 
         if gradient_ops is None:
             return [], g_input
@@ -946,7 +1010,7 @@ class GradientRegistry(object):
         return gradient_ops, g_input
 
     @classmethod
-    def GetBackwardPass(cls, operators, ys):
+    def GetBackwardPass(cls, operators, ys, ys_generate_gradient=False):
         """Gets the backward pass for the list of operators.
 
         Args:
@@ -1085,8 +1149,14 @@ def clone_and_bind_net(net, name, prefix, blob_remap=None, inputs=None,
         assert original is not None
         # TODO(azzolini): improve schema type checking
         diff = set(original.field_names()) - set(inputs.field_names())
-        assert len(diff) == 0, \
-            "Schemas don't match, extra fields {} found in the net".format(diff)
+        assert len(diff) == 0, (
+            "Schemas don't match, extra fields {diff} found in the net {name}. "
+            "original: {original}; inputs: {inputs}"
+            .format(
+                diff=diff, name=net.Name(), original=original.field_names(),
+                inputs=inputs.field_names()
+            )
+        )
         original_mapping = dict(zip(original.field_names(),
                                     original.field_blobs()))
         for fn, fb in zip(inputs.field_names(), inputs.field_blobs()):
@@ -1116,6 +1186,21 @@ def _get_blob_ref(blob_name_or_ref):
     )
 
 
+def _recover_record_by_prefix(names, prefix=''):
+    """
+    Tries to recover record by taking a subset of blob names with
+    a given prefix name and interpreting them as schema column names
+    """
+    from caffe2.python import schema
+    column_names = [name[len(prefix):] for name in names
+                    if name.startswith(prefix)]
+    if not column_names:
+        return None
+    return schema.from_column_list(
+        column_names,
+        col_blobs=[_get_blob_ref(prefix + name) for name in column_names])
+
+
 class Net(object):
     _net_names_used = set()
     operator_registry_ = {}
@@ -1128,8 +1213,9 @@ class Net(object):
 
     @staticmethod
     def _get_next_net_name(basename):
-        name = basename = '/'.join(filter(
-            lambda x: x, (Net.current_prefix(), basename)))
+        name = basename = '/'.join(
+            x for x in [Net.current_prefix(), basename] if x
+        )
         next_idx = 1
         while name in Net._net_names_used:
             name = basename + '_' + str(next_idx)
@@ -1198,13 +1284,20 @@ class Net(object):
 
     def AppendNet(self, net):
         assert isinstance(net, Net)
-        self._ExtendOps(net.Proto().op)
-        self.Proto().external_input.extend(
-            [i for i in net.Proto().external_input
-                if i not in self.Proto().external_input])
+        for i in net.Proto().external_input:
+            if (
+                i not in self.Proto().external_input and
+                i not in self._op_outputs
+            ):
+                self.Proto().external_input.append(i)
+
         self.Proto().external_output.extend(
-            [o for o in net.Proto().external_output
-                if o not in self.Proto().external_output])
+            [
+                o for o in net.Proto().external_output
+                if o not in self.Proto().external_output
+            ]
+        )
+        self._ExtendOps(net.Proto().op)
         return self
 
     def LogInfo(self, *msg_or_blobs):
@@ -1343,7 +1436,7 @@ class Net(object):
         if blob_remap is None:
             blob_remap = {}
         if op_id_mask is None:
-            op_id_mask = range(0, len(proto.op))
+            op_id_mask = list(range(0, len(proto.op)))
 
         def get_remapped_str(blob):
             blob_str = str(blob)
@@ -1597,9 +1690,12 @@ class Net(object):
             self.Proto().external_output.extend([str(output)])
 
     def AddScopedExternalInputs(self, *inputs):
-        return self.AddExternalInput(
+        res = self.AddExternalInput(
             * [ScopedBlobReference(str(b)) for b in inputs]
         )
+        if not isinstance(res, list):
+            res = [res]
+        return res
 
     def AddScopedExternalOutputs(self, *outputs):
         return self.AddExternalOutput(
@@ -1608,11 +1704,11 @@ class Net(object):
 
     @property
     def external_inputs(self):
-        return map(_get_blob_ref, self._net.external_input)
+        return [_get_blob_ref(x) for x in self._net.external_input]
 
     @property
     def external_outputs(self):
-        return map(_get_blob_ref, self._net.external_output)
+        return [_get_blob_ref(x) for x in self._net.external_output]
 
     def set_input_record(self, input_record):
         from caffe2.python import schema
@@ -1628,14 +1724,32 @@ class Net(object):
                     self.AddExternalInput(blob)
         return self._input_record
 
+    def recover_input_record_by_prefix(self, prefix):
+        """
+        Tries to recover input record by taking a subset of external_inputs with
+        a given prefix name and interpreting them as schema column names
+        """
+        record = _recover_record_by_prefix(self._net.external_input, prefix)
+        if record:
+            self.set_input_record(record)
+
     def set_output_record(self, record):
         assert self._output_record is None, (
             'Output record cannot be reset')
         for blob in record.field_blobs():
-            assert self.BlobIsDefined(blob)
+            assert self.BlobIsDefined(blob), "{} is not defined".format(blob)
         for blob in record.field_blobs():
             self.AddExternalOutput(blob)
         self._output_record = record
+
+    def recover_output_record_by_prefix(self, prefix):
+        """
+        Tries to recover out record by taking a subset of external_outputs with
+        a given prefix name and interpreting them as schema column names
+        """
+        record = _recover_record_by_prefix(self._net.external_output, prefix)
+        if record:
+            self.set_output_record(record)
 
     def AppendOutputRecordField(self, field_name, record):
         from caffe2.python import schema
@@ -1682,6 +1796,11 @@ class Net(object):
         if use_cudnn:
             for op in self._net.op:
                 op.engine = "CUDNN"
+    def RunAllOnMKL(self):
+        """A convenient function to run everything on the GPU."""
+        device_option = caffe2_pb2.DeviceOption()
+        device_option.device_type = caffe2_pb2.MKLDNN
+        self._net.device_option.CopyFrom(device_option)
 
     def _CreateAndAddToSelf(self, op_type, inputs, outputs=None, **kwargs):
         """A helper function to create an operator and add it to self.
@@ -1715,7 +1834,7 @@ class Net(object):
         if op_type.startswith('__'):
             raise AttributeError('Attribute {} not found.'.format(op_type))
         if not IsOperator(op_type) and not IsOperatorWithEngine(op_type, "CUDNN"):
-            raise RuntimeError(
+            raise AttributeError(
                 'Method ' + op_type + ' is not a registered operator.' +
                 ' Did you mean: [' +
                 ",".join(workspace.C.nearby_opnames(op_type)) + ']'
@@ -1723,11 +1842,29 @@ class Net(object):
         return lambda *args, **kwargs: self._CreateAndAddToSelf(
             op_type, *args, **kwargs)
 
-    def Python(self, f, grad_f=None, pass_workspace=False):
+    def __dir__(self):
+        additional_methods = [
+            op
+            for op in _REGISTERED_OPERATORS
+            if '_ENGINE_' not in op]
+        return sorted(set(
+            dir(type(self)) +
+            self.__dict__.keys() +
+            additional_methods))
+
+    def Python(
+        self,
+        f,
+        grad_f=None,
+        python_func_type=None,
+        pass_workspace=False,
+        grad_output_indices=None,
+        grad_input_indices=None
+    ):
         """
         Registers and returns a python operator.
 
-        `f` and `f_grad` can be one of the following:
+        `f` and `grad_f` can be one of the following:
             - a function with signature (inputs, outputs), where inputs and
               outputs are a list of CPUTensor objects. This function will be
               called from C++ everytime the operator is executed.
@@ -1741,22 +1878,238 @@ class Net(object):
               context, and allows to create and keep local python state across
               calls to the operator.
 
+        `python_func_type` is a type of an object that constructed as
+        python_func_type(f) and provides an implementation to forward and
+        backward functions. Its useful in such a case where users needs
+        a statefull PythonOp (ex: use autograd for computing grad_f).
+
         If `pass_workspace` is True, the signature is changed to
         (inputs, outputs, workspace) where `workspace` is the workspace the op
         is going to run on. This is potentially dangerous (as the op can
         manipulate the workspace directly), use on your own risk.
+
+        If a gradient function is specified (`grad_f`), by default its inputs
+        will be: (1) all inputs to `f`, (2) followed by all outputs of `f`, (3)
+        and then all gradient outputs of `f`. The outputs of `grad_f` will be
+        (by default) all gradient inputs to `f`. If a subset of the gradient
+        outputs or gradient inputs is desired instead, then the subsets can be
+        specified by providing `grad_output_indices` and/or `grad_input_indices`
+        which identify the indices of `f`'s inputs and outputs which have
+        gradients.
         """
         assert(IsOperator('Python'))
-        if isinstance(f, tuple) or isinstance(grad_f, tuple):
-            # if we got a tuple, we will make sure this tuple will be
-            # registered to run at startup on each of the workers in a
-            # distributed run.
-            registry = worker_init_func(_RegisterPythonImpl)
+
+        def make_builder(t):
+            if not isinstance(t, tuple):
+                return ''
+            assert len(t) == 3, 'Expected builder tuple (func, args, kwargs)'
+            func, args, kwargs = t
+            normalized = (func, tuple(args), dict(kwargs))
+            return pickle.dumps(normalized)
+
+        f_builder = make_builder(f)
+        grad_f_builder = make_builder(grad_f)
+
+        assert (not grad_f) or ((not f_builder) == (not grad_f_builder)), (
+            'A tuple has to be passed to both f and grad_f or neither.')
+
+        core_kwargs = {}
+        if f_builder:
+            core_kwargs['pickled_builder'] = f_builder
+            core_kwargs['pickled_grad_builder'] = grad_f_builder
+            core_kwargs['pass_workspace'] = pass_workspace
         else:
-            registry = _RegisterPythonImpl
-        token = registry(f, grad_f, pass_workspace=pass_workspace)
+            core_kwargs['token'] = _RegisterPythonImpl(
+                f, grad_f, python_func_type, pass_workspace=pass_workspace)
+
+        grad_output_indices = grad_output_indices or []
+        grad_input_indices = grad_input_indices or []
         return lambda *args, **kwargs: self._CreateAndAddToSelf(
-            'Python', token=token, *args, **kwargs)
+            'Python',
+            grad_output_indices=grad_output_indices,
+            grad_input_indices=grad_input_indices,
+            *args,
+            **dict(kwargs.items() + core_kwargs.items()))
+
+    def is_external_input(self, blob):
+        name = str(blob)
+        return name in self._external_input_map
+
+    def extend_ops(self, new_ops):
+        return self._ExtendOps(new_ops)
+
+
+def copy_func_between_devices(src, dst):
+    CPU = caffe2_pb2.CPU
+    CUDA = caffe2_pb2.CUDA
+
+    if src.device_type == CPU and dst.device_type == CPU:
+        return None
+
+    if src.device_type == CUDA and dst.device_type == CUDA:
+        if src.cuda_gpu_id == dst.cuda_gpu_id:
+            return None
+        else:
+            def fun(net, *args, **kw):
+                with DeviceScope(dst):
+                    return net.CopyGPUToGPU(*args, **kw)
+            return fun
+
+    if src.device_type == CUDA and dst.device_type == CPU:
+        def fun(net, *args, **kw):
+            with DeviceScope(src):
+                return net.CopyGPUToCPU(*args, **kw)
+        return fun
+
+    if src.device_type == CPU and dst.device_type == CUDA:
+        def fun(net, *args, **kw):
+            with DeviceScope(dst):
+                return net.CopyCPUToGPU(*args, **kw)
+        return fun
+
+    raise ValueError('Non-supported devices: %s and %s' % (src, dst))
+
+
+class RemapEntry:
+    def __init__(self, blob, device):
+        self.blob = blob
+        self.device = device
+
+    def __eq__(self, other):
+        return self.blob == other.blob and self.device == other.device
+
+    def __hash__(self):
+        return hash(self.blob + str(self.device))
+
+
+def InjectCrossDeviceCopies(net, blob_to_device=None):
+    '''
+    Injecting Copy functions between device within a net. Users can provide
+    a net with part of operators using different device_options. This method
+    will automatically create a new net with Copy ops inserted in it.
+
+    Inputs:
+      blob_to_device: If not None, it is a map of blobs and their device locations.
+    Outputs:
+      new_net: A new net with CopyCPUToGPU inserted with correct device option
+
+      required_external_to_device:
+               A mapping between unresolved external inputs and their
+               required device options.
+    Assumptions:
+      1. every external inputs of this net is already in blob_to_device!
+      2. if not, this function will use net device option
+    '''
+    new_net = net.Clone(net._net.name + '_cross_device', keep_schema=True)
+    del new_net._net.op[:]
+    blob_to_device = blob_to_device or {}
+    # remapping of input blobs for each op.
+    blob_remap = {}
+    temp_remap = {}
+    net_option = net._net.device_option or caffe2_pb2.DeviceOption()
+
+    for op in net._net.op:
+        temp_remap.clear()
+        # Get where inputs and outputs should be
+        input_dev, output_dev = InferOpBlobDevices(op)
+
+        for dev, input in zip(input_dev, op.input):
+            assert net.BlobIsDefined(input), \
+                "input {} should be defined in the net.".format(input)
+            if input not in blob_to_device:
+                if net.is_external_input(input):
+                    blob_to_device[input] = net_option
+                else:
+                    raise AttributeError(
+                        "No device information found for blob {}.".
+                        format(input)
+                    )
+
+            if not blob_to_device[input] == dev:
+                # reuse already moved input
+                if (RemapEntry(input, dev) in blob_remap and
+                        blob_to_device[blob_remap[RemapEntry(input, dev)]] == dev):
+                    temp_remap[input] = blob_remap[RemapEntry(input, dev)]
+                else:
+                    # need to make input on correct device.
+                    copy_func = copy_func_between_devices(
+                        blob_to_device[input], dev
+                    )
+
+                    def _gen_new_name(blob, device_option):
+                        CPU = caffe2_pb2.CPU
+                        CUDA = caffe2_pb2.CUDA
+                        if device_option.device_type == CPU:
+                            suffix = '_cpu'
+                        elif device_option.device_type == CUDA:
+                            suffix = '_cuda_' + str(device_option.cuda_gpu_id)
+                        else:
+                            raise RuntimeError(
+                                "Unknown device type: {}".
+                                format(device_option.device_type)
+                            )
+                        return blob + suffix
+
+                    new_name = _gen_new_name(input, dev)
+                    copy_func(new_net, input, new_name)
+                    blob_remap[RemapEntry(input, dev)] = new_name
+                    temp_remap[input] = new_name
+                    blob_to_device[new_name] = dev
+
+        # Enforcing no in-place blob usage
+        for out_blob in op.output:
+            if out_blob in blob_to_device:
+                raise RuntimeError(
+                    "In-place blob: {} is not supported for inject device copy "
+                    "yet. Consider implementing it.".
+                    format(out_blob)
+                )
+        blob_to_device.update({o: d for d, o in zip(output_dev, op.output)})
+        new_op = caffe2_pb2.OperatorDef()
+        new_op.CopyFrom(op)
+
+        new_list = [temp_remap.get(b, b) for b in new_op.input]
+        del new_op.input[:]
+        new_op.input.extend(new_list)
+        new_net.extend_ops([new_op])
+
+    return new_net, blob_to_device
+
+
+def InjectDeviceCopiesAmongNets(nets, blob_to_device_init=None):
+    """
+    Takes in a list of nets. They usually represent your whole execution graph.
+    This function will insert cross device copy functions to all nets, and resolve
+    inter-net external inputs dependencies. This method will insert Copy funcitons if
+    external inputs of a net is produced on different device than it is required.
+    Inputs:
+      nets: a list of nets
+    Outputs:
+      new_nets: a list of new nets with device difference solved.
+
+    Some notes from wyiming:
+      1. You MUST pass nets in execution order. e.g. [train_init, train]
+    """
+    assert isinstance(nets, list), \
+        "nets {} should be a list of nets.".format(str(nets))
+    assert all(isinstance(net, Net) for net in nets), \
+        "nets {} should be a list of nets.".format(str(nets))
+    # A holistic blob to device mapping.
+    blob_to_device = blob_to_device_init or {}
+    new_nets = []
+
+    for net in nets:
+        new_net, blob_to_device = InjectCrossDeviceCopies(
+            net, blob_to_device=blob_to_device
+        )
+        new_nets.append(new_net)
+
+    return new_nets, blob_to_device
+
+
+def InjectDeviceCopiesAmongNetsWithoutB2D(nets, blob_to_device_init=None):
+    new_nets, _ = InjectDeviceCopiesAmongNets(nets, blob_to_device_init)
+    return new_nets
 
 
 def get_net_name(netlike):
@@ -1861,6 +2214,14 @@ class ExecutionStep(object):
     def SetIter(self, num_iter):
         self._assert_can_mutate()
         self._step.num_iter = num_iter
+
+    def SetCreateWorkspace(self, create_workspace):
+        self._assert_can_mutate()
+        self._step.create_workspace = create_workspace
+
+    def SetNumConcurrentInstances(self, num_concurrent_instances):
+        self._assert_can_mutate()
+        self._step.num_concurrent_instances = num_concurrent_instances
 
     def SetOnlyOnce(self, only_once):
         self._assert_can_mutate()
@@ -2015,7 +2376,9 @@ def execution_step(default_name,
                    report_interval=None,
                    concurrent_substeps=None,
                    should_stop_blob=None,
-                   only_once=None):
+                   only_once=None,
+                   num_concurrent_instances=None,
+                   create_workspace=False):
     """
     Helper for creating an ExecutionStep.
     - steps_or_nets can be:
@@ -2047,6 +2410,10 @@ def execution_step(default_name,
     if report_net is not None:
         assert report_interval is not None
         step.SetReportNet(report_net, report_interval)
+    if num_concurrent_instances is not None:
+        step.SetNumConcurrentInstances(num_concurrent_instances)
+    if create_workspace:
+        step.SetCreateWorkspace(True)
 
     if isinstance(steps_or_nets, ExecutionStep):
         step.AddSubstep(steps_or_nets)
@@ -2054,9 +2421,11 @@ def execution_step(default_name,
         step.AddNet(steps_or_nets)
     elif isinstance(steps_or_nets, list):
         if all(isinstance(x, Net) for x in steps_or_nets):
-            map(step.AddNet, steps_or_nets)
+            for x in steps_or_nets:
+                step.AddNet(x)
         else:
-            map(step.AddSubstep, map(to_execution_step, steps_or_nets))
+            for x in steps_or_nets:
+                step.AddSubstep(to_execution_step(x))
     elif steps_or_nets:
         raise ValueError(
             'steps_or_nets must be a step, a net, or a list of nets or steps.')

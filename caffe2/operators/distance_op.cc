@@ -12,8 +12,8 @@ bool SquaredL2DistanceOp<float, CPUContext>::RunOnDevice() {
     CAFFE_ENFORCE_EQ(X.dim32(i), Y.dim32(i));
   }
   int N = X.ndim() > 0 ? X.dim32(0) : 1;
-  int D = X.size() / N;
   distance->Resize(N);
+  int D = N > 0 ? X.size() / N : 0;
   float* distance_data = distance->mutable_data<float>();
   const float* X_data = X.data<float>();
   const float* Y_data = Y.data<float>();
@@ -26,6 +26,71 @@ bool SquaredL2DistanceOp<float, CPUContext>::RunOnDevice() {
     math::Dot<float, CPUContext>(
         D, X_data + i * D, Y_data + i * D, &cross, &context_);
     distance_data[i] = (Xscale + Yscale) * 0.5 - cross;
+  }
+  return true;
+}
+
+template <>
+bool L1DistanceOp<float, CPUContext>::RunOnDevice() {
+  auto& X = Input(0);
+  auto& Y = Input(1);
+  auto* distance = Output(0);
+  CAFFE_ENFORCE_EQ(X.ndim(), Y.ndim());
+  for (int i = 0; i < X.ndim(); ++i) {
+    CAFFE_ENFORCE_EQ(X.dim32(i), Y.dim32(i));
+  }
+  distance->Resize(1);
+  const float* X_data = X.data<float>();
+  const float* Y_data = Y.data<float>();
+
+  *(distance->mutable_data<float>()) =
+      (ConstEigenVectorMap<float>(X_data, X.size()).array() -
+       ConstEigenVectorMap<float>(Y_data, Y.size()).array())
+          .abs()
+          .sum();
+  // L1(x, y) = sum(|x-y|)
+  return true;
+}
+
+template <>
+bool L1DistanceGradientOp<float, CPUContext>::RunOnDevice() {
+  auto& X = Input(0);
+  auto& Y = Input(1);
+  auto& dDistance = Input(2);
+  auto* dX = Output(0);
+  auto* dY = Output(1);
+  CAFFE_ENFORCE_EQ(X.ndim(), Y.ndim());
+  for (int i = 0; i < X.ndim(); ++i) {
+    CAFFE_ENFORCE_EQ(X.dim32(i), Y.dim32(i));
+  }
+  int N = X.ndim() > 0 ? X.dim32(0) : 1;
+  int D = N > 0 ? X.size() / N : 0;
+  CAFFE_ENFORCE(X.ndim() == Y.ndim());
+  for (int i = 0; i < X.ndim(); ++i) {
+    CAFFE_ENFORCE(X.dim32(i) == Y.dim32(i));
+  }
+  CAFFE_ENFORCE(dDistance.ndim() == 1);
+  CAFFE_ENFORCE(dDistance.dim32(0) == 1);
+  dX->ResizeLike(X);
+  dY->ResizeLike(Y);
+
+  for (int i = 0; i < N; ++i) {
+    auto offset = i * D;
+    for (int j = 0; j < D; ++j) {
+      const float temp =
+          (X.data<float>())[offset + j] - (Y.data<float>())[offset + j];
+      const float kEps = 1e-12;
+      if (temp < -kEps) {
+        dX->mutable_data<float>()[offset + j] = -(dDistance.data<float>())[0];
+        dY->mutable_data<float>()[offset + j] = (dDistance.data<float>())[0];
+      } else if (temp > kEps) {
+        dX->mutable_data<float>()[offset + j] = (dDistance.data<float>())[0];
+        dY->mutable_data<float>()[offset + j] = -(dDistance.data<float>())[0];
+      } else {
+        dX->mutable_data<float>()[offset + j] = 0;
+        dY->mutable_data<float>()[offset + j] = 0;
+      }
+    }
   }
   return true;
 }
@@ -48,13 +113,52 @@ bool DotProductOp<float, CPUContext>::RunOnDevice() {
     D = 0;
   }
   result->Resize(N);
-  float* result_data = result->mutable_data<float>();
-  const float* X_data = X.data<float>();
-  const float* Y_data = Y.data<float>();
+  float* result_data = result->template mutable_data<float>();
+  const float* X_data = X.template data<float>();
+  const float* Y_data = Y.template data<float>();
   for (int i = 0; i < N; ++i) { // TODO: multithreading
     auto offset = i * D;
     math::Dot<float, CPUContext>(
         D, X_data + offset, Y_data + offset, result_data + i, &context_);
+  }
+  return true;
+}
+
+template <>
+bool DotProductGradientOp<float, CPUContext>::RunOnDevice() {
+  auto& X = Input(X_IN);
+  auto& Y = Input(Y_IN);
+  auto& dDot = Input(DER_DOT_IN);
+  auto* dX = Output(DER_X_OUT);
+  auto* dY = Output(DER_Y_OUT);
+  int N, D;
+  if (X.size() > 0) {
+    N = X.ndim() > 0 ? X.dim32(0) : 1;
+    D = X.size() / N;
+  } else {
+    N = 0;
+    D = 0;
+  }
+  CAFFE_ENFORCE(X.ndim() == Y.ndim());
+  for (int i = 0; i < X.ndim(); ++i) {
+    CAFFE_ENFORCE(X.dim32(i) == Y.dim32(i));
+  }
+  CAFFE_ENFORCE(dDot.ndim() == 1);
+  CAFFE_ENFORCE(dDot.dim32(0) == N);
+  dX->ResizeLike(X);
+  dY->ResizeLike(Y);
+
+  const auto* X_data = X.template data<float>();
+  const auto* Y_data = Y.template data<float>();
+  const auto* dDot_data = dDot.template data<float>();
+  auto* dX_data = dX->template mutable_data<float>();
+  auto* dY_data = dY->template mutable_data<float>();
+  for (int i = 0; i < N; ++i) { // TODO: multithreading
+    auto offset = i * D;
+    math::Scale<float, CPUContext>(
+        D, dDot_data[i], X_data + offset, dY_data + offset, &context_);
+    math::Scale<float, CPUContext>(
+        D, dDot_data[i], Y_data + offset, dX_data + offset, &context_);
   }
   return true;
 }
@@ -175,7 +279,8 @@ OPERATOR_SCHEMA(SquaredL2Distance)
   of the L2 difference between X and Y that is computed as ||(X - Y)^2 / 2||.
   )DOC")
     .Input(0, "X", "1D input tensor")
-    .Output(0, "Y", "1D input tensor");
+    .Input(1, "Y", "1D input tensor")
+    .Output(0, "Z", "1D output tensor");
 
 OPERATOR_SCHEMA(SquaredL2DistanceGradient).NumInputs(3).NumOutputs(2);
 
@@ -189,6 +294,39 @@ class GetSquaredL2DistanceGradient : public GradientMakerBase {
   }
 };
 REGISTER_GRADIENT(SquaredL2Distance, GetSquaredL2DistanceGradient);
+
+// L1
+REGISTER_CPU_OPERATOR(L1Distance, L1DistanceOp<float, CPUContext>);
+REGISTER_CPU_OPERATOR(
+    L1DistanceGradient,
+    L1DistanceGradientOp<float, CPUContext>);
+
+OPERATOR_SCHEMA(L1Distance)
+    .NumInputs(2)
+    .NumOutputs(1)
+    .IdenticalTypeAndShapeOfInput(0)
+    .SetDoc(R"DOC(
+  Given two input float tensors X, Y, and produces one output float tensor
+  of the L1 difference between X and Y, computed as L1(x,y) = sum over |x-y|
+  )DOC")
+    .Input(0, "X", "1D input tensor")
+    .Input(1, "Y", "1D input tensor")
+    .Output(0, "Z", "1D output tensor");
+
+OPERATOR_SCHEMA(L1DistanceGradient).NumInputs(3).NumOutputs(2);
+
+class GetL1DistanceGradient : public GradientMakerBase {
+  using GradientMakerBase::GradientMakerBase;
+  vector<OperatorDef> GetGradientDefs() override {
+    return SingleGradientDef(
+        "L1DistanceGradient",
+        "",
+        vector<string>{I(0), I(1), GO(0)},
+        vector<string>{GI(0), GI(1)});
+  }
+};
+
+REGISTER_GRADIENT(L1Distance, GetL1DistanceGradient);
 
 // Dot Product
 REGISTER_CPU_OPERATOR(DotProduct, DotProductOp<float, CPUContext>);
@@ -205,7 +343,8 @@ OPERATOR_SCHEMA(DotProduct)
   of the dot product between X and Y.
   )DOC")
     .Input(0, "X", "1D input tensor")
-    .Output(0, "Y", "1D input tensor");
+    .Input(1, "Y", "1D input tensor")
+    .Output(0, "Z", "1D output tensor");
 
 OPERATOR_SCHEMA(DotProductGradient).NumInputs(3).NumOutputs(2);
 
@@ -236,7 +375,8 @@ OPERATOR_SCHEMA(CosineSimilarity)
   of the cosine similarity between X and Y.
   )DOC")
     .Input(0, "X", "1D input tensor")
-    .Output(0, "Y", "1D input tensor");
+    .Input(1, "Y", "1D input tensor")
+    .Output(0, "Z", "1D output tensor");
 
 OPERATOR_SCHEMA(CosineSimilarityGradient).NumInputs(3).NumOutputs(2);
 
@@ -271,7 +411,8 @@ OPERATOR_SCHEMA(DotProductWithPadding)
   2) replicate the smaller tensor to the same shape as the other one.
   )DOC")
     .Input(0, "X", "1D input tensor")
-    .Output(0, "Y", "1D input tensor")
+    .Input(1, "Y", "1D input tensor")
+    .Output(0, "Z", "1D output tensor")
     .Arg("pad_value", "the padding value for tensors with smaller dimension")
     .Arg("replicate", "wehther to replicate the smaller tensor or not");
 

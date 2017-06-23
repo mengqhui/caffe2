@@ -7,15 +7,17 @@ from __future__ import unicode_literals
 
 import contextlib
 import threading
+try:
+    from past.builtins import basestring
+except ImportError:
+    print("You don't have the past package installed. ",
+          "This is necessary for python 2/3 compatibility. ",
+          "To do this, do 'pip install future'.")
+    import sys
+    sys.exit(1)
 
 from caffe2.proto import caffe2_pb2
 
-# Python 2 and 3 compatibility: test if basestring exists
-try:
-    basestring  # NOQA
-except NameError:
-    # This is python3 so we define basestring.
-    basestring = str
 
 # The name scope and device scope when creating a new operator.
 _NAMESCOPE_SEPARATOR = '/'
@@ -48,10 +50,13 @@ def NameScope(prefix, reset=False):
         _threadlocal_scope.namescope = prefix
     else:
         _threadlocal_scope.namescope = _threadlocal_scope.namescope + prefix
-    yield
-    assert _threadlocal_scope.namescope.endswith(prefix), \
-        "The namescope variable is changed from outside NameScope() calls."
-    _threadlocal_scope.namescope = old_scope
+
+    try:
+        yield
+    finally:
+        assert _threadlocal_scope.namescope.endswith(prefix), \
+            "The namescope variable is changed from outside NameScope() calls."
+        _threadlocal_scope.namescope = old_scope
 
 
 @contextlib.contextmanager
@@ -61,7 +66,9 @@ def DeviceScope(scope):
     global _threadlocal_scope
     old_scope = CurrentDeviceScope()
     _threadlocal_scope.devicescope = scope
-    yield
-    assert _threadlocal_scope.devicescope == scope, \
-        "The device scope is changed from outside DeviceScope() calls."
-    _threadlocal_scope.devicescope = old_scope
+    try:
+        yield
+    finally:
+        assert _threadlocal_scope.devicescope == scope, \
+            "The device scope is changed from outside DeviceScope() calls."
+        _threadlocal_scope.devicescope = old_scope

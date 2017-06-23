@@ -5,9 +5,8 @@ from __future__ import print_function
 import numpy as np
 from hypothesis import given, assume
 import hypothesis.strategies as st
-from itertools import izip
 
-from caffe2.python import core, cnn
+from caffe2.python import core, model_helper, brew
 import caffe2.python.hypothesis_test_util as hu
 
 
@@ -46,7 +45,7 @@ class TestInstanceNorm(hu.HypothesisTestCase):
 
     def _feed_inputs(self, input_blobs, device_option):
         names = ['input', 'scale', 'bias']
-        for name, blob in izip(names, input_blobs):
+        for name, blob in zip(names, input_blobs):
             self.ws.create_blob(name).feed(blob, device_option=device_option)
 
     @given(gc=hu.gcs['gc'],
@@ -87,7 +86,8 @@ class TestInstanceNorm(hu.HypothesisTestCase):
         # The gradient only flows from output #0 since the other two only
         # store the temporary mean and inv_stdev buffers.
         # Check dl/dinput
-        self.assertGradientChecks(gc, op, input_blobs, 0, [0])
+        self.assertGradientChecks(gc, op, input_blobs, 0, [0], stepsize=0.005,
+                                  threshold=0.01)
         # Check dl/dscale
         self.assertGradientChecks(gc, op, input_blobs, 1, [0])
         # Check dl/dbias
@@ -226,10 +226,11 @@ class TestInstanceNorm(hu.HypothesisTestCase):
            order=st.sampled_from(['NCHW', 'NHWC']),
            epsilon=st.floats(1e-6, 1e-4),
            seed=st.integers(0, 1000))
-    def test_instance_norm_cnn_helper(self, N, C, H, W, order, epsilon, seed, is_test):
+    def test_instance_norm_model_helper_helper(self, N, C, H, W, order, epsilon, seed, is_test):
         np.random.seed(seed)
-        model = cnn.CNNModelHelper(order=order)
-        model.InstanceNorm(
+        model = model_helper.ModelHelper(name="test_model")
+        brew.instance_norm(
+            model,
             'input',
             'output',
             C,

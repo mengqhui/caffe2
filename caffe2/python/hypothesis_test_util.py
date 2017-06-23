@@ -43,6 +43,7 @@ from caffe2.python import (
     workspace, device_checker, gradient_checker, test_util, core)
 import contextlib
 import copy
+import functools
 import hypothesis
 import hypothesis.extra.numpy
 import hypothesis.strategies as st
@@ -57,6 +58,7 @@ def is_sandcastle():
     elif os.getenv('TW_JOB_USER') == 'sandcastle':
         return True
     return False
+
 
 hypothesis.settings.register_profile(
     "sandcastle",
@@ -133,22 +135,31 @@ def segment_ids(size, is_sorted):
             elements=st.integers(min_value=0, max_value=2 * size))
 
 
-def lengths(size, **kwargs):
+def lengths(size, min_segments=None, max_segments=None, **kwargs):
     # First generate number of boarders between segments
     # Then create boarder values and add 0 and size
     # By sorting and computing diff we convert them to lengths of
     # possible 0 value
-    if size == 0:
+    if min_segments is None:
+        min_segments = 0
+    if max_segments is None:
+        max_segments = size
+    assert min_segments >= 0
+    assert min_segments <= max_segments
+    if size == 0 and max_segments == 0:
         return st.just(np.empty(shape=[0], dtype=np.int32))
+    assert max_segments > 0, "size is not 0, need at least one segment"
     return st.integers(
-        min_value=0, max_value=size - 1
-    ).flatmap(lambda num_boarders:
+        min_value=max(min_segments - 1, 0), max_value=max_segments - 1
+    ).flatmap(
+        lambda num_borders:
         hypothesis.extra.numpy.arrays(
-            np.int32, num_boarders, elements=st.integers(
+            np.int32, num_borders, elements=st.integers(
                 min_value=0, max_value=size
             )
         )
-    ).map(lambda x: np.append(x, np.array([0, size], dtype=np.int32))
+    ).map(
+        lambda x: np.append(x, np.array([0, size], dtype=np.int32))
     ).map(sorted).map(np.diff)
 
 
@@ -173,8 +184,10 @@ def segmented_tensor(
     ))
 
 
-def lengths_tensor(*args, **kwargs):
-    return segmented_tensor(*args, segment_generator=lengths, **kwargs)
+def lengths_tensor(min_segments=None, max_segments=None, *args, **kwargs):
+    gen = functools.partial(
+        lengths, min_segments=min_segments, max_segments=max_segments)
+    return segmented_tensor(*args, segment_generator=gen, **kwargs)
 
 
 def sparse_segmented_tensor(min_dim=1, max_dim=4, dtype=np.float32,
@@ -205,6 +218,7 @@ def tensors(n, min_dim=1, max_dim=4, dtype=np.float32, elements=None, **kwargs):
     return dims_.flatmap(
         lambda dims: st.lists(arrays(dims, dtype, elements),
                               min_size=n, max_size=n))
+
 
 cpu_do = caffe2_pb2.DeviceOption()
 gpu_do = caffe2_pb2.DeviceOption(device_type=caffe2_pb2.CUDA)
@@ -512,7 +526,7 @@ class HypothesisTestCase(test_util.TestCase):
                     "proper one should return a tuple/list of numpy arrays.")
             if not outputs_to_check:
                 self.assertEqual(len(reference_outputs), len(op.output))
-                outputs_to_check = range(len(op.output))
+                outputs_to_check = list(range(len(op.output)))
             outs = []
             for (output_index, ref) in zip(outputs_to_check, reference_outputs):
                 output_blob_name = op.output[output_index]
@@ -541,13 +555,14 @@ class HypothesisTestCase(test_util.TestCase):
             return outs
 
     def assertValidationChecks(
-        self,
-        device_option,
-        op,
-        inputs,
-        validator,
-        input_device_options=None,
-        as_kwargs=True
+            self,
+            device_option,
+            op,
+            inputs,
+            validator,
+            input_device_options=None,
+            as_kwargs=True,
+            init_net=None,
     ):
         if input_device_options is None:
             input_device_options = {}
@@ -565,6 +580,8 @@ class HypothesisTestCase(test_util.TestCase):
                     b,
                     device_option=input_device_options.get(n, device_option)
                 )
+            if init_net:
+                workspace.RunNetOnce(init_net)
             workspace.RunOperatorOnce(op)
             outputs = [workspace.FetchBlob(n) for n in op.output]
             if as_kwargs:

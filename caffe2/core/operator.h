@@ -1,6 +1,7 @@
 #ifndef CAFFE2_CORE_OPERATOR_H_
 #define CAFFE2_CORE_OPERATOR_H_
 
+#include <array>
 #include <climits>
 #include <cstddef>
 #include <exception>
@@ -10,13 +11,14 @@
 #include "caffe2/core/blob.h"
 #include "caffe2/core/common.h"
 #include "caffe2/core/net.h"
+#include "caffe2/core/observer.h"
 #include "caffe2/core/operator_gradient.h"
 #include "caffe2/core/operator_schema.h"
 #include "caffe2/core/registry.h"
 #include "caffe2/core/tensor.h"
 #include "caffe2/core/workspace.h"
-#include "caffe2/utils/proto_utils.h"
 #include "caffe2/proto/caffe2.pb.h"
+#include "caffe2/utils/proto_utils.h"
 
 namespace caffe2 {
 
@@ -127,6 +129,17 @@ class OperatorBase {
     return arg_helper_;
   }
 
+  void SetObserver(ObserverBase<OperatorBase>* observer) {
+    observer_ = observer;
+  }
+
+  void RemoveObserver() {
+    observer_ = nullptr;
+  }
+
+ protected:
+  ObserverBase<OperatorBase>* observer_ = nullptr;
+
  private:
   OperatorDef operator_def_;
   ArgumentHelper arg_helper_;
@@ -177,12 +190,12 @@ class Operator : public OperatorBase {
     // constructors will run on that device.
     context_.SwitchToDevice(0);
   }
-  virtual ~Operator() noexcept {}
+  ~Operator() noexcept override {}
 
   inline const Tensor<Context>& Input(int idx) {
     return OperatorBase::template Input<Tensor<Context> >(idx); }
   inline Tensor<Context>* Output(int idx) {
-    return OperatorBase::template Output<Tensor<Context> >(idx);
+    return OperatorBase::template Output<Tensor<Context>>(idx);
   }
 
   // The run function of Operator switches to the device, and then carries out
@@ -190,6 +203,9 @@ class Operator : public OperatorBase {
   // instead of Run().
   bool Run(int stream_id = 0) final {
     try {
+      if (observer_) {
+        observer_->Start();
+      }
       context_.SwitchToDevice(stream_id);
       bool started = RunOnDevice();
       bool finished = context_.FinishDeviceComputation();
@@ -199,6 +215,9 @@ class Operator : public OperatorBase {
         // recovered, so we should log FATAL.
         LOG(FATAL) << "Computation on device returned error in operator\n"
                    << ProtoDebugString(this->def());
+      }
+      if (observer_) {
+        observer_->Stop();
       }
       return (started && finished);
     } catch (EnforceNotMet& err) {
@@ -340,6 +359,10 @@ struct DispatchHelper<FixedValues<>, ExtraArgs...> {
     static bool call(Op* op, const Tensor<Context>& tensor) {                  \
       return call<Op>(op, tensor.meta());                                      \
     }                                                                          \
+    template <typename Op>                                                     \
+    static bool call(Op* op, const Blob& blob) {                               \
+      return call<Op>(op, blob.meta());                                        \
+    }                                                                          \
   };                                                                           \
                                                                                \
   template <typename... ExtraArgs>                                             \
@@ -351,6 +374,10 @@ struct DispatchHelper<FixedValues<>, ExtraArgs...> {
     template <typename Op, typename Context>                                   \
     static bool call(Op* op, const Tensor<Context>& tensor) {                  \
       return call<Op>(op, tensor.meta());                                      \
+    }                                                                          \
+    template <typename Op>                                                     \
+    static bool call(Op* op, const Blob& blob) {                               \
+      return call<Op>(op, blob.meta());                                        \
     }                                                                          \
   };                                                                           \
                                                                                \
@@ -365,6 +392,10 @@ struct DispatchHelper<FixedValues<>, ExtraArgs...> {
     template <typename Op, typename Context>                                   \
     static bool call(Op* op, const Tensor<Context>& tensor) {                  \
       return call<Op>(op, tensor.meta());                                      \
+    }                                                                          \
+    template <typename Op>                                                     \
+    static bool call(Op* op, const Blob& blob) {                               \
+      return call<Op>(op, blob.meta());                                        \
     }                                                                          \
   };
 CAFFE2_DEFINE_TENSOR_TYPES_DISPATCHER(
@@ -448,6 +479,32 @@ CAFFE_DECLARE_REGISTRY(
 // Macros for cudnn since we use it often
 #define REGISTER_CUDNN_OPERATOR(name, ...) \
   REGISTER_CUDA_OPERATOR_WITH_ENGINE(name, CUDNN, __VA_ARGS__)
+
+// StaticLinkingProtector is a helper class that ensures that the Caffe2
+// library is linked correctly with whole archives (in the case of static
+// linking). What happens is that when CreateOperator is called for the first
+// time, it instantiates an OperatorLinkingProtector object to check if the
+// operator registry is empty. If it is empty, this means that we are not
+// properly linking the library.
+//
+// You should not need to use this class.
+struct StaticLinkingProtector {
+  StaticLinkingProtector() {
+    const int registered_ops = CPUOperatorRegistry()->Keys().size();
+    // Note: this is a check failure instead of an exception, because if
+    // the linking is wrong, Caffe2 won't be able to run properly anyway,
+    // so it's better to fail loud.
+    // If Caffe2 is properly linked with whole archive, there should be more
+    // than zero registered ops.
+    if (registered_ops == 0) {
+      LOG(FATAL) <<
+        "You might have made a build error: the Caffe2 library does not seem "
+        "to be linked with whole-static library option. To do so, use "
+        "-Wl,-force_load (clang) or -Wl,--whole-archive (gcc) to link the "
+        "Caffe2 library.";
+    }
+  }
+};
 
 // An exception that can be thrown by an operator constructor that notifies
 // that it does not support the given setting. This can be usually used for

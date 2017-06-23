@@ -48,16 +48,19 @@ unique_ptr<OperatorBase> TryCreateOperator(
   try {
     return registry->Create(key, operator_def, ws);
   } catch (const UnsupportedOperatorFeature& err) {
-    VLOG(1) << "Operator " << operator_def.type()
-            << " does not support the requested feature. Msg: " << err.what()
-            << ". Proto is: " << ProtoDebugString(operator_def);
+    LOG(WARNING) << "Operator " << operator_def.type()
+                 << " does not support the requested feature. Msg: "
+                 << err.what()
+                 << ". Proto is: " << ProtoDebugString(operator_def);
     return nullptr;
   }
 }
+
 }  // namespace
 
 unique_ptr<OperatorBase> CreateOperator(
     const OperatorDef& operator_def, Workspace* ws) {
+  static StaticLinkingProtector g_protector;
   // first, check with OpSchema if the operator is legal.
   auto* schema = OpSchemaRegistry::Schema(operator_def.type());
   if (schema) {
@@ -191,43 +194,94 @@ static TensorShapes InferBlobShapesAndTypes(
     CaffeMap<string, TensorShape>& blob_desc,
     const vector<std::unique_ptr<NetDef>>& nets) {
   for (auto& defptr : nets) {
+    // Hack to work with auto split gradients
+    CaffeMap<string, string> unmatched_sum_blobs;
+
     for (const OperatorDef& op : defptr.get()->op()) {
+      // Hack to ignore queues
+      if (op.type().find("Dequeue") != std::string::npos ||
+          op.type().find("Enqueue") != std::string::npos) {
+        continue;
+      }
+
       vector<TensorShape> input_desc;
+      bool found_all = true;
       for (const string& in : op.input()) {
         auto inp_desc = blob_desc.find(in);
         if (inp_desc == blob_desc.end()) {
-          CAFFE_THROW(
-              "Shape and type inference failed, could not find shape for ", in);
+          LOG(WARNING) << "Shape and type inference failed for input: " << in
+                       << " for op " << op.type() << ", skipping.";
+          found_all = false;
+          break;
         }
         input_desc.push_back(inp_desc->second);
       }
+      if (!found_all) {
+        continue;
+      }
       auto op_schema = OpSchemaRegistry::Schema(op.type());
       if (op_schema == nullptr) {
-        CAFFE_THROW("Shape inference failed, since no schema for: ", op.type());
+        LOG(WARNING) << "Shape inference failed, no schema for: " << op.type();
+        continue;
       }
 
-      std::vector<TensorShape> out = op_schema->InferTensor(op, input_desc);
-      if (op.is_gradient_op() && out.size()) {
-        // Special handling for gradient ops. We can assume gradients
-        // are of same size as the corresponding variables. This is bit
-        // ugly to base on string matching, but we don't have the connection
-        // between variable and its gradient specified
+      // Special handling for Sum as it used with the autosplits, which have
+      // different naming convention. Assuming that all sum inputs must be of
+      // same size, we can infer their shapes.
+      if (op.type() == "Sum") {
+        TensorShape sum_shape;
+        for (auto inp : op.input()) {
+          auto it = blob_desc.find(inp);
+          if (it != blob_desc.end() && !it->second.unknown_shape()) {
+            if (it->second.dims_size() > 0) {
+              sum_shape = blob_desc[inp];
+              break;
+            }
+          }
+        }
+        for (auto inp : op.input()) {
+          auto it = blob_desc.find(inp);
+          if (it == blob_desc.end() || it->second.unknown_shape()) {
+            blob_desc[inp] = sum_shape;
+            if (sum_shape.dims_size() == 0) {
+              // Match later with the output
+              unmatched_sum_blobs[inp] = op.output(0);
+            }
+          }
+        }
+      }
 
-        CaffeMap<string, string> grads_to_params =
-            GradientMakerBase::MatchGradsToParams(op);
+      std::vector<TensorShape> out;
+      try {
+        out = op_schema->InferTensor(op, input_desc);
+        if (op.is_gradient_op() && out.size()) {
+          // Special handling for gradient ops. We can assume gradients
+          // are of same size as the corresponding variables. This is bit
+          // ugly to base on string matching, but we don't have the connection
+          // between variable and its gradient specified
 
-        for (int i = 0; i < out.size(); i++) {
-          if (out[i].unknown_shape()) {
-            std::string gradout = op.output(i);
+          CaffeMap<string, string> grads_to_params =
+              GradientMakerBase::MatchGradsToParams(op);
 
-            if (grads_to_params.find(gradout) != grads_to_params.end()) {
-              std::string var = grads_to_params[gradout];
-              if (blob_desc.find(var) != blob_desc.end()) {
-                out[i] = blob_desc[var];
+          for (int i = 0; i < out.size(); i++) {
+            if (out[i].unknown_shape()) {
+              std::string gradout = op.output(i);
+
+              if (grads_to_params.find(gradout) != grads_to_params.end()) {
+                std::string var = grads_to_params[gradout];
+                if (blob_desc.find(var) != blob_desc.end()) {
+                  out[i] = blob_desc[var];
+                }
               }
             }
           }
         }
+      } catch (::caffe2::EnforceNotMet& enf) {
+        LOG(ERROR) << "Shape inference error: " << enf.msg();
+        LOG(ERROR) << "Operator: " << ProtoDebugString(op) << std::endl;
+        LOG(ERROR) << "Returning empty results.";
+        TensorShapes tps;
+        return tps;
       }
 
       if (out.size() != op.output_size()) {
@@ -243,8 +297,15 @@ static TensorShapes InferBlobShapesAndTypes(
           blob_desc[op.output(i)] = out[i];
         }
       }
+    } // net.ops
+
+    for (auto& unmatched : unmatched_sum_blobs) {
+      if (blob_desc.find(unmatched.second) != blob_desc.end()) {
+        blob_desc[unmatched.first] = blob_desc[unmatched.second];
+      }
     }
-  }
+
+  } // nets
   TensorShapes tps;
   for (auto kv : blob_desc) {
     TensorShape& tp = kv.second;

@@ -274,6 +274,292 @@ class CheckDatasetConsistencyOp : public Operator<CPUContext> {
   TreeIterator iterator_;
 };
 
+/**
+ * Simple wrapper class allowing an easy traversal of the tensors representing
+ * the hirerarchical structure.
+ */
+class TreeWalker {
+ public:
+  TreeWalker(const vector<const Blob*>& inputs, TreeCursor& cursor)
+      : inputs_(inputs), cursor_(cursor), sizes_(cursor.it.numOffsetFields()) {
+    if (cursor.offsets.empty()) {
+      cursor.offsets.assign(cursor.it.numOffsetFields(), 0);
+    }
+
+    for (int fieldId = 0; fieldId < cursor_.it.fields().size(); ++fieldId) {
+      fields_.emplace_back(*this, fieldId);
+    }
+
+    gatherLengthData();
+
+    gatherSizeLimits();
+
+    // The invariant we hold is that we are always one step ahead
+    advance();
+  }
+
+  // Returns the number of records in a dataset
+  inline TOffset size() const {
+    return limits_.at(0);
+  }
+
+  void advance() {
+    prevOffsets_ = cursor_.offsets;
+    cursor_.it.advance(lengths_, cursor_.offsets, sizes_, limits_, 1);
+  }
+
+ private:
+  inline const TensorCPU& input(int32_t idx) const {
+    return inputs_[idx]->Get<TensorCPU>();
+  }
+
+  // TODO: Change to fieldDesc
+  inline const TreeIterator::FieldDesc& field(int idx) const {
+    return cursor_.it.fields().at(idx);
+  }
+
+  inline int lengthIdx(int fieldId) const {
+    return field(fieldId).lengthFieldId + 1;
+  }
+
+  inline TOffset offset(int fieldId) const {
+    return prevOffsets_[lengthIdx(fieldId)];
+  }
+
+  std::vector<TIndex> fieldDim(int fieldId) const {
+    auto tensorDim = input(fieldId).dims();
+    tensorDim[0] = sizes_[lengthIdx(fieldId)];
+    return tensorDim;
+  }
+
+  void* fieldPtr(int fieldId) const {
+    auto& in = input(fieldId);
+    return (char*)in.raw_data() +
+        offset(fieldId) * in.size_from_dim(1) * in.meta().itemsize();
+  }
+
+ public:
+  // Simple Proxy class to expose nicer API for field access
+  class Field {
+   public:
+    Field(TreeWalker& walker, int fieldId)
+        : walker_(walker), fieldId_(fieldId) {}
+
+    inline std::vector<TIndex> dim() const {
+      return walker_.fieldDim(fieldId_);
+    }
+
+    inline const TypeMeta& meta() const {
+      return walker_.input(fieldId_).meta();
+    }
+
+    inline void* ptr() const {
+      return walker_.fieldPtr(fieldId_);
+    }
+
+   private:
+    const TreeWalker& walker_;
+    const int fieldId_;
+  };
+
+  // Notice that a reference is returned. If advance() is called the fields will
+  // be updated to represent the new state.
+  inline const std::vector<Field>& fields() const {
+    return fields_;
+  }
+
+ private:
+  void gatherLengthData() {
+    static const TLength lenZero = 0;
+    lengths_.resize(cursor_.it.numLengthFields());
+    for (int i = 0; i < lengths_.size(); ++i) {
+      auto& in = input(cursor_.it.lengthField(i).id);
+      if (in.size() > 0) {
+        lengths_[i] = in.data<int>();
+      } else {
+        lengths_[i] = &lenZero;
+      }
+    }
+  }
+
+  void gatherSizeLimits() {
+    limits_.assign(sizes_.size(), std::numeric_limits<TOffset>::max());
+    for (auto fieldId = 0; fieldId < cursor_.it.fields().size(); ++fieldId) {
+      auto lengthFieldIdx = lengthIdx(fieldId);
+      limits_[lengthFieldIdx] =
+          std::min(limits_[lengthFieldIdx], (TOffset)input(fieldId).dims()[0]);
+    }
+  }
+
+  const vector<const Blob*>& inputs_;
+  TreeCursor& cursor_;
+  std::vector<Field> fields_;
+
+  std::vector<const TLength*> lengths_;
+  std::vector<TOffset> limits_;
+  std::vector<TOffset> sizes_;
+  std::vector<TOffset> offsets_;
+  std::vector<TOffset> prevOffsets_;
+};
+
+using SharedTensorVectorPtr = std::shared_ptr<std::vector<TensorCPU>>;
+
+class PackRecordsOp : public Operator<CPUContext> {
+ public:
+  PackRecordsOp(const OperatorDef& operator_def, Workspace* ws)
+      : Operator(operator_def, ws),
+        fields_(OperatorBase::GetRepeatedArgument<std::string>("fields")) {}
+
+  bool RunOnDevice() override {
+    // There should be one input per field
+    CAFFE_ENFORCE_EQ(InputSize(), fields_.size());
+    CAFFE_ENFORCE_EQ(OutputSize(), 1);
+
+    TreeCursor cursor((TreeIterator(fields_)));
+
+    TreeWalker walker(Inputs(), cursor);
+
+    Output(0)->Resize(walker.size());
+
+    // Output(0)->raw_mutable_data(TypeMeta::Make<SharedTensorVectorPtr>()));
+    auto* dst = Output(0)->mutable_data<SharedTensorVectorPtr>();
+
+    for (int batchId = 0; batchId < walker.size(); ++batchId) {
+      dst[batchId] = std::make_shared<std::vector<TensorCPU>>();
+      dst[batchId]->reserve(walker.fields().size());
+
+      for (const auto& field : walker.fields()) {
+        dst[batchId]->emplace_back(field.dim());
+        auto& tensor = dst[batchId]->back();
+        context_.template CopyItems<CPUContext, CPUContext>(
+            field.meta(),
+            tensor.size(),
+            field.ptr() /* src */,
+            tensor.raw_mutable_data(field.meta()) /* dst */);
+      }
+
+      walker.advance();
+    }
+
+    return true;
+  }
+
+ private:
+  std::vector<std::string> fields_;
+};
+
+class UnPackRecordsOp : public Operator<CPUContext> {
+ public:
+  UnPackRecordsOp(const OperatorDef& operator_def, Workspace* ws)
+      : Operator(operator_def, ws),
+        fields_(OperatorBase::GetRepeatedArgument<std::string>("fields")) {}
+
+  bool RunOnDevice() override {
+    const auto* inputs = Input(0).template data<SharedTensorVectorPtr>();
+    const auto numRows = Input(0).size();
+
+    CAFFE_ENFORCE_GE(numRows, 0);
+
+    auto numTensors = OutputSize();
+
+    // Precomputer the output sizes to avoid resizing
+    std::vector<std::vector<TIndex>> outputDims(numTensors);
+    std::vector<const TypeMeta*> metas(numTensors);
+
+    CAFFE_ENFORCE(
+        numRows > 0 || InputSize() > 1,
+        "Unpacking empty record without shape will leave output blobs in "
+        "undefined state.");
+
+    if (InputSize() == 1) {
+      getShapeAndMetaFromInput(outputDims, metas);
+    } else {
+      getShapeAndMetaFromPrototypeBlobs(outputDims, metas);
+    }
+
+    for (int i = 0; i < numRows; ++i) {
+      CAFFE_ENFORCE(inputs[i]);
+      for (int j = 0; j < inputs[i]->size(); ++j) {
+        const auto& input = inputs[i]->at(j);
+
+        // Checks to ensure that dimensions/sizes match
+        CAFFE_ENFORCE_EQ(outputDims[j].size(), input.ndim());
+        CAFFE_ENFORCE(*metas[j] == input.meta());
+        // We look from first dimension, because we concat on the first.
+        for (int k = 1; k < input.ndim(); ++k) {
+          CAFFE_ENFORCE_EQ(input.dims()[k], outputDims[j][k]);
+        }
+
+        outputDims[j][0] += input.dim(0);
+      }
+    }
+
+    // Resize to the final output size
+    std::vector<void*> destinations(numTensors);
+    for (int i = 0; i < numTensors; ++i) {
+      Output(i)->Resize(outputDims[i]);
+      destinations[i] = Output(i)->raw_mutable_data(*metas[i]);
+    }
+
+    for (int i = 0; i < numRows; ++i) {
+      for (int j = 0; j < numTensors; ++j) {
+        const auto& input = inputs[i]->at(j);
+
+        context_.CopyItems<CPUContext, CPUContext>(
+            *metas[j],
+            input.size(),
+            input.raw_data() /* src */,
+            destinations[j] /* dst */
+            );
+
+        destinations[j] =
+            (char*)destinations[j] + input.size() * input.itemsize();
+      }
+    }
+
+    return true;
+  }
+
+ private:
+  void getShapeAndMetaFromInput(
+    std::vector<std::vector<TIndex>>& outputDims,
+    std::vector<const TypeMeta*>& metas
+  ) {
+    const auto* inputs = Input(0).template data<SharedTensorVectorPtr>();
+
+    const auto& inputZero = inputs[0];
+    CAFFE_ENFORCE(inputZero);
+
+    const auto numTensors = inputZero->size();
+
+    CAFFE_ENFORCE_EQ(numTensors, fields_.size());
+    CAFFE_ENFORCE_EQ(numTensors, OutputSize());
+
+    for (int i = 0; i < numTensors; ++i) {
+      outputDims[i] = inputZero->at(i).dims();
+      outputDims[i][0] = 0;
+      metas[i] = &inputZero->at(i).meta();
+    }
+  }
+
+  void getShapeAndMetaFromPrototypeBlobs(
+    std::vector<std::vector<TIndex>>& outputDims,
+    std::vector<const TypeMeta*>& metas
+  ) {
+    const auto numTensors = fields_.size();
+    CAFFE_ENFORCE_EQ(numTensors, InputSize() - 1);
+    CAFFE_ENFORCE_EQ(numTensors, OutputSize());
+    for (int i = 0; i < numTensors; ++i) {
+      const auto& input = Input(i + 1);
+      outputDims[i] = input.dims();
+      outputDims[i][0] = 0;
+      metas[i] = &input.meta();
+    }
+  }
+
+  std::vector<std::string> fields_;
+};
+
 class ReadNextBatchOp : public Operator<CPUContext> {
  public:
   ReadNextBatchOp(const OperatorDef& operator_def, Workspace* ws)
@@ -479,7 +765,8 @@ class ReadRandomBatchOp : public Operator<CPUContext> {
  public:
   ReadRandomBatchOp(const OperatorDef& operator_def, Workspace* ws)
       : Operator(operator_def, ws),
-        batchSize_(OperatorBase::GetSingleArgument<int>("batch_size", 1)) {}
+        batchSize_(OperatorBase::GetSingleArgument<int>("batch_size", 1)),
+        loopOver_(OperatorBase::GetSingleArgument<bool>("loop_over", false)) {}
   bool RunOnDevice() override {
     auto& cursor = OperatorBase::Input<std::unique_ptr<TreeCursor>>(0);
     auto& idxblob = Input(1);
@@ -494,6 +781,10 @@ class ReadRandomBatchOp : public Operator<CPUContext> {
       std::lock_guard<std::mutex> lock(cursor->mutex_);
       cursor->offsets.resize(1);
       idx = cursor->offsets.at(0);
+      if (loopOver_ && idx >= idxblob.size()) {
+        cursor->offsets.at(0) = 0;
+        idx = 0;
+      }
       cursor->offsets.at(0) += batchSize_;
     }
 
@@ -551,6 +842,7 @@ class ReadRandomBatchOp : public Operator<CPUContext> {
     return true;
   }
   int batchSize_;
+  bool loopOver_;
 };
 
 template <class Context>
@@ -565,7 +857,7 @@ class AppendOp final : public Operator<Context> {
     auto& b = Input(1);
     auto* c = Output(0);
     CAFFE_ENFORCE(b.ndim() >= 1);
-    if (a.size() == 0) {
+    if (a.size() == 0 && a.dim(0) == 0) {
       c->CopyFrom(b);
       return true;
     }
@@ -623,7 +915,7 @@ class AtomicAppendOp final : public Operator<Context> {
       auto& a = Input(1 + i);
       auto& b = Input(1 + i + numFields);
       auto* c = Output(i);
-      if (a.size() == 0) {
+      if (a.size() == 0 && a.dim(0) == 0) {
         c->CopyFrom(b);
         continue;
       }
@@ -803,6 +1095,8 @@ REGISTER_CPU_OPERATOR(CreateTensorVector, CreateTensorVectorOp<CPUContext>);
 REGISTER_CPU_OPERATOR(TensorVectorSize, TensorVectorSizeOp<CPUContext>);
 REGISTER_CPU_OPERATOR(ConcatTensorVector, ConcatTensorVectorOp<CPUContext>);
 REGISTER_CPU_OPERATOR(CollectTensor, CollectTensorOp<CPUContext>);
+REGISTER_CPU_OPERATOR(PackRecords, PackRecordsOp);
+REGISTER_CPU_OPERATOR(UnPackRecords, UnPackRecordsOp);
 
 OPERATOR_SCHEMA(CreateTreeCursor)
     .NumInputs(0)
@@ -972,7 +1266,8 @@ ReadRandomBatch is thread safe.
     .Input(2, "offsetsmat", "offset matrix containing length offset info.")
     .Input(3, "dataset_field_0", "First dataset field")
     .Output(0, "field_0", "Tensor containing the next batch for field 0.")
-    .Arg("batch_size", "Number of top-level entries to read.");
+    .Arg("batch_size", "Number of top-level entries to read.")
+    .Arg("loop_over", "(bool) Repeat the dataset indefinitely");
 
 OPERATOR_SCHEMA(CheckDatasetConsistency)
     .NumInputs(1, INT_MAX)
@@ -1048,6 +1343,45 @@ output vectors.
 )DOC")
     .Arg("num_to_collect", "The max number of tensors to collect");
 
+OPERATOR_SCHEMA(PackRecords)
+    .NumInputs(1, INT_MAX)
+    .NumOutputs(1)
+    .SetDoc(R"DOC(
+Given a dataset under a schema specified by the `fields` argument will pack all
+the input tensors into one, where each tensor element represents a row of data
+(batch of size 1). This format allows easier use with the rest of Caffe2
+operators.
+)DOC")
+    .Arg(
+        "fields",
+        "List of strings representing the string names in the format"
+        "specified in the doc for CreateTreeCursor.")
+    .Output(
+        0,
+        "tensor",
+        "One dimensional tensor having a complex type of SharedTensorVectorPtr."
+        " In order to reverse it back to the original input it has to be "
+        "inserted into UnPackRecordsOp.");
+
+OPERATOR_SCHEMA(UnPackRecords)
+    .NumInputs(1, INT_MAX)
+    .NumOutputs(1, INT_MAX)
+    .SetDoc(R"DOC(
+Given a packed dataset (packed by the PackRecordsOp) and the `fields` argument
+describing the datasets schema returns the original dataset format. Number of
+returned tensors is equal to the number of fields in the `fields` argument.
+
+The first input is the packed tensor to be unpacked. Optionally, you can provide
+prototype tensors to give the expected shapes of the output tensors. This is
+helpful when you expected to unpack empty tensor, e.g., output of a sapmling
+process.
+)DOC")
+    .Arg(
+        "fields",
+        "List of strings representing the string names in the format"
+        "specified in the doc for CreateTreeCursor.")
+    .Input(0, "packed_tensor", "The tensor to be unpacked");
+
 SHOULD_NOT_DO_GRADIENT(CreateTreeCursor);
 SHOULD_NOT_DO_GRADIENT(ResetCursor);
 SHOULD_NOT_DO_GRADIENT(ReadNextBatch);
@@ -1060,9 +1394,12 @@ SHOULD_NOT_DO_GRADIENT(CreateTensorVector);
 SHOULD_NOT_DO_GRADIENT(TensorVectorSize);
 SHOULD_NOT_DO_GRADIENT(ConcatTensorVector);
 SHOULD_NOT_DO_GRADIENT(CollectTensor);
+SHOULD_NOT_DO_GRADIENT(UnPackRecords);
+SHOULD_NOT_DO_GRADIENT(PackRecords);
 } // namespace
 CAFFE_KNOWN_TYPE(std::unique_ptr<TreeCursor>);
 CAFFE_KNOWN_TYPE(TensorVectorPtr<CPUContext>);
+CAFFE_KNOWN_TYPE(SharedTensorVectorPtr);
 
 namespace {
 

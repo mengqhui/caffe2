@@ -19,7 +19,7 @@ Utilities for logging experiment run stats, such as accuracy
 and loss over time for different runs. Runtime arguments are stored
 in the log.
 
-Optionally, ModelTrainerLog calls out to an logger to log to
+Optionally, ModelTrainerLog calls out to a logger to log to
 an external log destination.
 '''
 
@@ -64,7 +64,8 @@ class ModelTrainerLog():
 
         if external_loggers is not None:
             self.external_loggers = external_loggers
-            runtime_args = dict(vars(runtime_args))
+            if not isinstance(runtime_args, dict):
+                runtime_args = dict(vars(runtime_args))
             runtime_args['experiment_id'] = self.experiment_id
             runtime_args['hostname'] = socket.gethostname()
             for logger in self.external_loggers:

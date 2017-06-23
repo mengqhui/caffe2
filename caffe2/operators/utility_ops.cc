@@ -9,6 +9,48 @@ bool WeightedSumOp<CPUContext>::RunOnDevice() {
   return DoRunWithType<float>();
 }
 
+template <>
+template <typename T>
+void UniqueOp<CPUContext>::DoRun() {
+  auto& inputTensor = Input(0);
+  // use dim32 to enforce that it's fine to have remapping of type int
+  int N = inputTensor.dim32(0);
+  CAFFE_ENFORCE_EQ(inputTensor.ndim(), 1, "Input should be a vector");
+  auto* uniqueTensor = Output(UNIQUE);
+
+  int* remapping = nullptr;
+  if (REMAPPING < OutputSize()) {
+    auto* remappingTensor = Output(REMAPPING);
+    remappingTensor->ResizeLike(inputTensor);
+    remapping = remappingTensor->template mutable_data<int>();
+  }
+
+  const T* input = inputTensor.template data<T>();
+  // TODO(dzhulgakov): if perf becomes an issue consider doing hash table
+  // instead of sorting
+  order_.resize(N);
+  std::iota(order_.begin(), order_.end(), 0);
+  std::sort(order_.begin(), order_.end(), [input](const int x, const int y) {
+    return input[x] < input[y];
+  });
+  int K = N;
+  for (int i = 1; i < N; ++i) {
+    K -= input[order_[i]] == input[order_[i - 1]];
+  }
+  uniqueTensor->Resize(K);
+  T* unique = uniqueTensor->template mutable_data<T>();
+  K = 0;
+  T prev = -1;
+  for (int i = 0; i < N; ++i) {
+    if (i == 0 || prev != input[order_[i]]) {
+      prev = unique[K++] = input[order_[i]];
+    }
+    if (remapping) {
+      remapping[order_[i]] = K - 1;
+    }
+  }
+}
+
 namespace {
 
 REGISTER_CPU_OPERATOR(WallClockTime, WallClockTimeOp<CPUContext>);
@@ -317,6 +359,16 @@ OPERATOR_SCHEMA(CopyGPUToCPU)
     .NumInputs(1)
     .NumOutputs(1)
     .IdenticalTypeAndShape()
+    .DeviceInferenceFunction([](const OperatorDef& def) {
+      CAFFE_ENFORCE(
+          def.has_device_option(),
+          "CopyGPUToCPU op should have cuda device option.");
+      auto& cuda_option = def.device_option();
+      auto cpu_option = DeviceOption();
+      vector<DeviceOption> in_dev(def.input_size(), cuda_option);
+      vector<DeviceOption> out_dev(def.output_size(), cpu_option);
+      return std::make_pair(in_dev, out_dev);
+    })
     .SetDoc(R"DOC(
 Copy tensor for GPU to CPU context. Must be run under GPU device option.
 )DOC")
@@ -327,6 +379,16 @@ OPERATOR_SCHEMA(CopyCPUToGPU)
     .NumInputs(1)
     .NumOutputs(1)
     .IdenticalTypeAndShape()
+    .DeviceInferenceFunction([](const OperatorDef& def) {
+      CAFFE_ENFORCE(
+          def.has_device_option(),
+          "CopyCPUToGPU op should have cuda device option.");
+      auto& cuda_option = def.device_option();
+      auto cpu_option = DeviceOption();
+      vector<DeviceOption> in_dev(def.input_size(), cpu_option);
+      vector<DeviceOption> out_dev(def.output_size(), cuda_option);
+      return std::make_pair(in_dev, out_dev);
+    })
     .SetDoc(R"DOC(
 Copy tensor for CPU to GPU context. Must be run under GPU device option.
 )DOC")
@@ -337,6 +399,14 @@ OPERATOR_SCHEMA(EnsureCPUOutput)
     .NumInputs(1)
     .NumOutputs(1)
     .IdenticalTypeAndShape()
+    .DeviceInferenceFunction([](const OperatorDef& def) {
+      auto op_device =
+          def.has_device_option() ? def.device_option() : DeviceOption();
+      auto cpu_option = DeviceOption();
+      vector<DeviceOption> in_dev(def.input_size(), op_device);
+      vector<DeviceOption> out_dev(def.output_size(), cpu_option);
+      return std::make_pair(in_dev, out_dev);
+    })
     .SetDoc(R"DOC(
 Take an input tensor in the current Context (GPU or CPU) and create an output
 which is always a TensorCPU. This may involves cross-device MemCpy.
@@ -348,6 +418,14 @@ OPERATOR_SCHEMA(CopyFromCPUInput)
     .NumInputs(1)
     .NumOutputs(1)
     .IdenticalTypeAndShape()
+    .DeviceInferenceFunction([](const OperatorDef& def) {
+      auto op_device =
+          def.has_device_option() ? def.device_option() : DeviceOption();
+      auto cpu_option = DeviceOption();
+      vector<DeviceOption> in_dev(def.input_size(), cpu_option);
+      vector<DeviceOption> out_dev(def.output_size(), op_device);
+      return std::make_pair(in_dev, out_dev);
+    })
     .SetDoc(R"DOC(
 Take a CPU input tensor and copy it to an output in the current
 Context (GPU or CPU). This may involves cross-device MemCpy.
@@ -1004,4 +1082,20 @@ OPERATOR_SCHEMA(NanCheck)
         "output",
         "Tensor to copy input into if no NaNs or inf."
         " Can be in-place");
+
+OPERATOR_SCHEMA(Size)
+    .NumInputs(1)
+    .NumOutputs(1)
+    .SetDoc(
+        "Return a 1D tensor of type int64 that contains the number "
+        "of elements of the input tensor")
+    .Input(0, "tensor", "Tensor to calculate number of elements")
+    .Output(
+        0,
+        "output",
+        "1D tensor of type int64 that contains the number of "
+        "elements in the input tensor.");
+
+REGISTER_CPU_OPERATOR(Size, SizeOp<CPUContext>);
+NO_GRADIENT(Size);
 } // namespace caffe2

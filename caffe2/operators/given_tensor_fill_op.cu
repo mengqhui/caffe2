@@ -5,5 +5,9 @@ namespace caffe2 {
 namespace {
 
 REGISTER_CUDA_OPERATOR(GivenTensorFill, GivenTensorFillOp<float, CUDAContext>);
+REGISTER_CUDA_OPERATOR(GivenTensorIntFill, GivenTensorFillOp<int, CUDAContext>);
+REGISTER_CUDA_OPERATOR(
+    GivenTensorBoolFill,
+    GivenTensorFillOp<bool, CUDAContext>);
 }
 }
